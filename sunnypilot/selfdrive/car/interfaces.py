@@ -87,7 +87,7 @@ def _initialize_subaru(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params
     return
 
   stop_and_go = params.get_bool("SubaruStopAndGo")
-  stop_and_go_manual_parking_brake = params.get_bool("SubaruManualParkingBrakeSng")
+  stop_and_go_manual_parking_brake = params.get_bool("SubaruStopAndGoManualParkingBrake")
 
   if stop_and_go:
     CP_SP.flags |= SubaruFlagsSP.STOP_AND_GO.value

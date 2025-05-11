@@ -13,7 +13,7 @@ SubaruSettings::SubaruSettings(QWidget *parent) : BrandSettingsInterface(parent)
   list->addItem(stopAndGoToggle);
 
   stopAndGoManualParkingBrakeToggle = new ParamControl(
-    "SubaruManualParkingBrakeSng",
+    "SubaruStopAndGoManualParkingBrake",
     tr("Stop and Go for Manual Parking Brake (Beta)"),
     "",
     ""
