@@ -104,7 +104,7 @@ def setup_interfaces(CI: CarInterfaceBase, params: Params = None) -> None:
   _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params)
   _initialize_neural_network_lateral_control(CI, CP, CP_SP, params)
   _initialize_radar_tracks(CP, CP_SP, params)
-  _initialize_subaru(CP, CP_SP, params)
+  # _initialize_subaru(CP, CP_SP, params)
 
 
 def _enable_radar_tracks(CP: structs.CarParams, CP_SP: structs.CarParamsSP, can_recv: CanRecvCallable,
