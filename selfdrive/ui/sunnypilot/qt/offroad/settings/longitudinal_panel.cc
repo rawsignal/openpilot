@@ -33,6 +33,14 @@ LongitudinalPanel::LongitudinalPanel(QWidget *parent) : QWidget(parent) {
   cruisePanelScroller = new ScrollViewSP(list, this);
   vlayout->addWidget(cruisePanelScroller);
 
+  customAccIncrement = new CustomAccIncrement(
+    "CustomAccIncrementsEnabled",
+    tr("Custom ACC Speed Increments"),
+    "",
+    "",
+    this);
+  list->addItem(customAccIncrement);
+
   slcControl = new SpeedLimitControl(
     "SpeedLimitControl",
     tr("Speed Limit Control (SLC)"),
@@ -60,4 +68,37 @@ LongitudinalPanel::LongitudinalPanel(QWidget *parent) : QWidget(parent) {
 
 void LongitudinalPanel::showEvent(QShowEvent *event) {
   main_layout->setCurrentWidget(cruisePanelScreen);
+  refresh();
+}
+
+void LongitudinalPanel::refresh() {
+  auto cp_bytes = params.get("CarParamsPersistent");
+  if (!cp_bytes.empty()) {
+    AlignedBuffer aligned_buf;
+    capnp::FlatArrayMessageReader cmsg(aligned_buf.align(cp_bytes.data(), cp_bytes.size()));
+    cereal::CarParams::Reader CP = cmsg.getRoot<cereal::CarParams>();
+
+    has_longitudinal_control = hasLongitudinalControl(CP);
+    is_pcm_cruise = CP.getPcmCruise();
+  } else {
+    has_longitudinal_control = false;
+    is_pcm_cruise = false;
+  }
+
+  QString accEnabledDescription = tr("Enable custom Short & Long press increments for cruise speed increase/decrease.");
+  QString accNoLongDescription = tr("This feature can only be used with openpilot longitudinal control enabled.");
+
+  if (has_longitudinal_control) {
+    if (!is_pcm_cruise) {
+      customAccIncrement->setDescription(accEnabledDescription);
+    }
+  } else {
+    params.remove("CustomAccIncrementsEnabled");
+    customAccIncrement->toggleFlipped(false);
+    customAccIncrement->setDescription(accNoLongDescription);
+    customAccIncrement->showDescription();
+  }
+
+  customAccIncrement->setVisible(!(has_longitudinal_control && is_pcm_cruise));  // do not show toggle when long is available and is PCM cruise
+  customAccIncrement->setEnabled(has_longitudinal_control && !is_pcm_cruise);  // enable toggle when long is available and is not PCM cruise
 }
