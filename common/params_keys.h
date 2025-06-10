@@ -131,6 +131,8 @@ inline static std::unordered_map<std::string, uint32_t> keys = {
     {"CarParamsSPCache", CLEAR_ON_MANAGER_START},
     {"CarParamsSPPersistent", PERSISTENT},
     {"CarPlatformBundle", PERSISTENT},
+    {"ChevronHysteresis", PERSISTENT | BACKUP},
+    {"ChevronMinimal", PERSISTENT | BACKUP},
     {"CustomAccIncrementsEnabled", PERSISTENT | BACKUP},
     {"CustomAccLongPressIncrement", PERSISTENT | BACKUP},
     {"CustomAccShortPressIncrement", PERSISTENT | BACKUP},

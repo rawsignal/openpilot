@@ -16,7 +16,11 @@ public:
 private:
   void update_model(const cereal::ModelDataV2::Reader &model, const cereal::RadarState::LeadData::Reader &lead) override;
   void drawPath(QPainter &painter, const cereal::ModelDataV2::Reader &model, const QRect &rect) override;
+  void drawLead(QPainter &painter, const cereal::RadarState::LeadData::Reader &lead_data, const QPointF &vd, const QRect &surface_rect);
 
+  float hysteretic_x = 0.0f;
+  const float hysteresis_factor = 0.4f;
+  Params params;
   QPolygonF left_blindspot_vertices;
   QPolygonF right_blindspot_vertices;
 };
