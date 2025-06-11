@@ -33,21 +33,18 @@ LongitudinalPanel::LongitudinalPanel(QWidget *parent) : QWidget(parent) {
   cruisePanelScroller = new ScrollViewSP(list, this);
   vlayout->addWidget(cruisePanelScroller);
 
-  customAccIncrement = new CustomAccIncrement(
-    "CustomAccIncrementsEnabled",
-    tr("Custom ACC Speed Increments"),
-    "",
-    "",
-    this);
+  customAccIncrement = new CustomAccIncrement("CustomAccIncrementsEnabled", tr("Custom ACC Speed Increments"), "", "", this);
   list->addItem(customAccIncrement);
 
+  QObject::connect(uiState(), &UIState::offroadTransition, this, &LongitudinalPanel::refresh);
+
   slcControl = new SpeedLimitControl(
-    "SpeedLimitControl",
-    tr("Speed Limit Control (SLC)"),
-    tr("When you engage ACC, you will be prompted to set the cruising speed to the speed limit of the road adjusted by the Offset and Source Policy specified, or the current driving speed. "
-      "The maximum cruising speed will always be the MAX set speed."),
-    "",
-    this);
+   "SpeedLimitControl",
+   tr("Speed Limit Control (SLC)"),
+   tr("When you engage ACC, you will be prompted to set the cruising speed to the speed limit of the road adjusted by the Offset and Source Policy specified, or the current driving speed. "
+     "The maximum cruising speed will always be the MAX set speed."),
+   "",
+   this);
   list->addItem(slcControl);
 
   connect(slcControl, &SpeedLimitControl::slcSettingsButtonClicked, [=]() {
@@ -64,14 +61,15 @@ LongitudinalPanel::LongitudinalPanel(QWidget *parent) : QWidget(parent) {
   main_layout->addWidget(cruisePanelScreen);
   main_layout->addWidget(slcScreen);
   main_layout->setCurrentWidget(cruisePanelScreen);
+  refresh(offroad);
 }
 
 void LongitudinalPanel::showEvent(QShowEvent *event) {
   main_layout->setCurrentWidget(cruisePanelScreen);
-  refresh();
+  refresh(offroad);
 }
 
-void LongitudinalPanel::refresh() {
+void LongitudinalPanel::refresh(bool _offroad) {
   auto cp_bytes = params.get("CarParamsPersistent");
   if (!cp_bytes.empty()) {
     AlignedBuffer aligned_buf;
@@ -87,18 +85,31 @@ void LongitudinalPanel::refresh() {
 
   QString accEnabledDescription = tr("Enable custom Short & Long press increments for cruise speed increase/decrease.");
   QString accNoLongDescription = tr("This feature can only be used with openpilot longitudinal control enabled.");
+  QString accPcmCruiseDisabledDescription = tr("This feature is not supported on this platform due to vehicle limitations.");
+  QString onroadOnlyDescription = tr("Start the vehicle to check vehicle compatibility.");
 
-  if (has_longitudinal_control) {
-    if (!is_pcm_cruise) {
-      customAccIncrement->setDescription(accEnabledDescription);
-    }
-  } else {
-    params.remove("CustomAccIncrementsEnabled");
-    customAccIncrement->toggleFlipped(false);
-    customAccIncrement->setDescription(accNoLongDescription);
+  if (offroad) {
+    customAccIncrement->setDescription(onroadOnlyDescription);
     customAccIncrement->showDescription();
+  } else {
+    if (has_longitudinal_control) {
+      if (is_pcm_cruise) {
+        customAccIncrement->setDescription(accPcmCruiseDisabledDescription);
+        customAccIncrement->showDescription();
+      } else {
+        customAccIncrement->setDescription(accEnabledDescription);
+      }
+    } else {
+      params.remove("CustomAccIncrementsEnabled");
+      customAccIncrement->toggleFlipped(false);
+      customAccIncrement->setDescription(accNoLongDescription);
+      customAccIncrement->showDescription();
+    }
   }
 
-  customAccIncrement->setVisible(!(has_longitudinal_control && is_pcm_cruise));  // do not show toggle when long is available and is PCM cruise
-  customAccIncrement->setEnabled(has_longitudinal_control && !is_pcm_cruise);  // enable toggle when long is available and is not PCM cruise
+  // enable toggle when long is available and is not PCM cruise
+  customAccIncrement->setEnabled(has_longitudinal_control && !is_pcm_cruise && !offroad);
+  customAccIncrement->refresh();
+
+  offroad = _offroad;
 }
