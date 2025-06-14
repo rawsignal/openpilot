@@ -50,8 +50,8 @@ class ControlsExt:
     CC_SP.leadRelSpeed = 0.0
     CC_SP.leadVisible = sm['longitudinalPlan'].hasLead
 
-    if sm.valid["radarState"]:
-      leadOne = sm["radarState"].leadOne
+    if sm.valid['radarState']:
+      leadOne = sm['radarState'].leadOne
       # Set leadDistance and leadRelSpeed if the lead vehicle is detected
       CC_SP.leadDistance = leadOne.dRel if leadOne.status else 0.0
       CC_SP.leadRelSpeed = leadOne.vRel if leadOne.status else 0.0
