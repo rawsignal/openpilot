@@ -9,11 +9,11 @@ from cereal import messaging, custom
 from opendbc.car import structs
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
-from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit_controller.speed_limit_controller import SpeedLimitController
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.selfdrive.controls.lib.vision_turn_controller import VisionTurnController
 
+from openpilot.sunnypilot.selfdrive.controls.lib.vibe_personality.vibe_personality import VibePersonalityController
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 
 
@@ -22,9 +22,9 @@ class LongitudinalPlannerSP:
     self.events_sp = EventsSP()
 
     self.dec = DynamicExperimentalController(CP, mpc)
-    self.slc = SpeedLimitController(CP)
-    self.accel_controller = AccelController()
     self.v_tsc = VisionTurnController(CP)
+    self.slc = SpeedLimitController(CP)
+    self.vibe_controller = VibePersonalityController()
 
   def get_mpc_mode(self) -> str | None:
     if not self.dec.active():
@@ -33,27 +33,28 @@ class LongitudinalPlannerSP:
     return self.dec.mode()
 
   def update_v_cruise(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> float:
-      self.events_sp.clear()
+    self.events_sp.clear()
 
-      self.slc.update(sm, v_ego, a_ego, v_cruise, self.events_sp)
-      v_cruise_slc = self.slc.speed_limit_offseted if self.slc.is_active else V_CRUISE_UNSET
+    self.slc.update(sm, v_ego, a_ego, v_cruise, self.events_sp)
 
-      self.v_tsc.update(sm, sm['carControl'].enabled, v_ego, a_ego, v_cruise)
-      v_cruise_v_tsc = self.v_tsc.v_turn if self.v_tsc.is_active else V_CRUISE_UNSET
+    v_cruise_slc = self.slc.speed_limit_offseted if self.slc.is_active else V_CRUISE_UNSET
 
-      cruise_speeds = [v_cruise]
+    self.v_tsc.update(sm, sm['carControl'].enabled, v_ego, a_ego, v_cruise)
+    v_cruise_v_tsc = self.v_tsc.v_turn if self.v_tsc.is_active else V_CRUISE_UNSET
 
-      if self.v_tsc.is_active and v_cruise_v_tsc != V_CRUISE_UNSET:
-          cruise_speeds.append(v_cruise_v_tsc)
-      if self.slc.is_active and v_cruise_slc != V_CRUISE_UNSET:
-          cruise_speeds.append(v_cruise_slc)
+    cruise_speeds = [v_cruise]
 
-      v_cruise_final = min(cruise_speeds)
-      return v_cruise_final
+    if self.v_tsc.is_active and v_cruise_v_tsc != V_CRUISE_UNSET:
+      cruise_speeds.append(v_cruise_v_tsc)
+    if self.slc.is_active and v_cruise_slc != V_CRUISE_UNSET:
+      cruise_speeds.append(v_cruise_slc)
+
+    v_cruise_final = min(cruise_speeds)
+    return v_cruise_final
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.dec.update(sm)
-    self.accel_controller.update()
+    self.vibe_controller.update()
 
   def publish_longitudinal_plan_sp(self, sm: messaging.SubMaster, pm: messaging.PubMaster) -> None:
     plan_sp_send = messaging.new_message('longitudinalPlanSP')
@@ -69,6 +70,13 @@ class LongitudinalPlannerSP:
     dec.enabled = self.dec.enabled()
     dec.active = self.dec.active()
 
+    # Vision Turn Speed Control
+    visionTurnSpeedControl = longitudinalPlanSP.visionTurnSpeedControl
+    visionTurnSpeedControl.state = self.v_tsc.state
+    visionTurnSpeedControl.velocity = float(self.v_tsc.v_turn)
+    visionTurnSpeedControl.currentLateralAccel = float(self.v_tsc.current_lat_acc)
+    visionTurnSpeedControl.maxPredictedLateralAccel = float(self.v_tsc.max_pred_lat_acc)
+
     # Speed Limit Control
     slc = longitudinalPlanSP.slc
     slc.state = self.slc.state
@@ -77,12 +85,5 @@ class LongitudinalPlannerSP:
     slc.speedLimit = float(self.slc.speed_limit)
     slc.speedLimitOffset = float(self.slc.speed_limit_offset)
     slc.distToSpeedLimit = float(self.slc.distance)
-
-    # Vision Turn Speed Control
-    visionTurnSpeedControl = longitudinalPlanSP.visionTurnSpeedControl
-    visionTurnSpeedControl.state = self.v_tsc.state
-    visionTurnSpeedControl.velocity = float(self.v_tsc.v_turn)
-    visionTurnSpeedControl.currentLateralAccel = float(self.v_tsc.current_lat_acc)
-    visionTurnSpeedControl.maxPredictedLateralAccel = float(self.v_tsc.max_pred_lat_acc)
 
     pm.send('longitudinalPlanSP', plan_sp_send)
