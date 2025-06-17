@@ -11,7 +11,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.locationd.helpers import PointBuckets, ParameterEstimator, PoseCalibrator, Pose
 
-from sunnypilot.models.modeld_lagd import ModeldLagd
+from openpilot.sunnypilot.livedelay.lagd_toggle import LagdToggle
 
 HISTORY = 5  # secs
 POINTS_PER_BUCKET = 1500
@@ -51,10 +51,9 @@ class TorqueBuckets(PointBuckets):
         break
 
 
-class TorqueEstimator(ParameterEstimator, ModeldLagd):
+class TorqueEstimator(ParameterEstimator, LagdToggle):
   def __init__(self, CP, decimated=False, track_all_points=False):
-    ParameterEstimator.__init__(self)
-    ModeldLagd.__init__(self)
+    super().__init__()
     self.CP = CP
     self.hist_len = int(HISTORY / DT_MDL)
     self.lag = 0.0
