@@ -12,7 +12,7 @@ class LagdToggle:
   def __init__(self):
     self.params = Params()
     self.lag = 0.0
-    self.software_delay = 0.2
+    self.software_delay = 0.104
 
   def lagd_main(self, CP, sm, model):
     if self.params.get_bool("LagdToggle"):
