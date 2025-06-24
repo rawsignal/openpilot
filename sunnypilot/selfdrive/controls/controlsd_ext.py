@@ -26,7 +26,7 @@ class ControlsExt:
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['longitudinalPlan', 'selfdriveStateSP', 'radarState', 'drivingModelData']
+    self.sm_services_ext = ['longitudinalPlan', 'selfdriveStateSP', 'radarState']
     self.pm_services_ext = ['carControlSP']
 
   def get_params_sp(self) -> None:
@@ -56,12 +56,23 @@ class ControlsExt:
       CC_SP.leadDistance = leadOne.dRel if leadOne.status else 0.0
       CC_SP.leadRelSpeed = leadOne.vRel if leadOne.status else 0.0
 
+  def _set_custom_lane_positioning(self, CC_SP: custom.CarControlSP,  sm: messaging.SubMaster) -> None:
+    """ Update custom LanePositioning in CarControlSP. """
+    CC_SP.lanelineLeftY = 0.0
+    CC_SP.lanelineRightY = 0.0
+
+    if len(sm['modelV2'].laneLines):
+      CC_SP.lanelineLeftY = sm['modelV2'].laneLines[1].y[0]
+      CC_SP.lanelineRightY = sm['modelV2'].laneLines[2].y[0]
 
   def state_control_ext(self, sm: messaging.SubMaster) -> custom.CarControlSP:
     CC_SP = custom.CarControlSP.new_message()
 
     # Custom LeadVehicle state
     self._set_custom_lead_vehicle_state(CC_SP, sm)
+
+    # Custom Lanelines Positioning
+    self._set_custom_lane_positioning(CC_SP, sm)
 
     # MADS state
     CC_SP.mads = sm['selfdriveStateSP'].mads

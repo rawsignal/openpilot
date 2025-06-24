@@ -224,6 +224,8 @@ struct CarControlSP @0xa5cd762cd951a455 {
   leadRelSpeed @2 :Float32;
   leadVisible @3 :Bool;
   params @4 :List(Param);
+  lanelineLeftY @5 :Float32;
+  lanelineRightY @6 :Float32;
 
   struct Param {
     key @0 :Text;
