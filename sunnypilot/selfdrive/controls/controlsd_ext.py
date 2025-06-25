@@ -60,10 +60,12 @@ class ControlsExt:
     """ Update custom LanePositioning in CarControlSP. """
     CC_SP.lanelineLeftY = 0.0
     CC_SP.lanelineRightY = 0.0
+    modelv2 = sm['modelV2']
 
-    if len(sm['modelV2'].laneLines):
-      CC_SP.lanelineLeftY = sm['modelV2'].laneLines[1].y[0]
-      CC_SP.lanelineRightY = sm['modelV2'].laneLines[2].y[0]
+    if len(modelv2.laneLines):
+      if modelv2.laneLineProbs[1] > 0.5 and modelv2.laneLineProbs[2] > 0.5:
+        CC_SP.lanelineLeftY = modelv2.laneLines[1].y[0]
+        CC_SP.lanelineRightY = modelv2.laneLines[2].y[0]
 
   def state_control_ext(self, sm: messaging.SubMaster) -> custom.CarControlSP:
     CC_SP = custom.CarControlSP.new_message()
