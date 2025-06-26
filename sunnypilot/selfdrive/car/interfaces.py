@@ -7,8 +7,6 @@ See the LICENSE.md file in the root directory for more details.
 
 from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
-from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
@@ -21,22 +19,6 @@ def log_fingerprint(CP: structs.CarParams) -> None:
     sentry.capture_fingerprint_mock()
   else:
     sentry.capture_fingerprint(CP.carFingerprint, CP.brand)
-
-
-def _initialize_custom_longitudinal_tuning(CI: CarInterfaceBase, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
-                                           params: Params = None) -> None:
-  if params is None:
-    params = Params()
-
-  # Hyundai Custom Longitudinal Tuning
-  if CP.brand == 'hyundai':
-    hyundai_longitudinal_tuning = int(params.get("HyundaiLongitudinalTuning", encoding="utf8") or 0)
-    if hyundai_longitudinal_tuning == LongitudinalTuningType.DYNAMIC:
-      CP_SP.flags |= HyundaiFlagsSP.LONG_TUNING_DYNAMIC.value
-    if hyundai_longitudinal_tuning == LongitudinalTuningType.PREDICTIVE:
-      CP_SP.flags |= HyundaiFlagsSP.LONG_TUNING_PREDICTIVE.value
-
-  CP_SP = CI.get_longitudinal_tuning_sp(CP, CP_SP)
 
 
 def _initialize_neural_network_lateral_control(CI: CarInterfaceBase, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
@@ -64,5 +46,49 @@ def setup_interfaces(CI: CarInterfaceBase, params: Params = None) -> None:
   CP = CI.CP
   CP_SP = CI.CP_SP
 
-  _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params)
   _initialize_neural_network_lateral_control(CI, CP, CP_SP, params)
+
+
+def _custom_acc_controls(CP_SP: structs.CarParamsSP, params: Params = None) -> None:
+  if params is None:
+    params = Params()
+
+  is_metric = params.get_bool("IsMetric")
+
+  try:
+    custom_enabled = params.get_bool("CustomAccIncrementsEnabled")
+    short_inc = int(params.get("CustomAccShortPressIncrement"))
+    long_inc = int(params.get("CustomAccLongPressIncrement"))
+
+    short_inc = short_inc if custom_enabled and 1 <= short_inc <= 10 else 1
+    long_inc = long_inc if custom_enabled and 1 <= long_inc <= 10 else 10 if is_metric else 5
+
+  except Exception:
+    custom_enabled = False
+    short_inc = 1
+    long_inc = 10 if is_metric else 5
+
+  CP_SP.customAccControl.mode = structs.CarParamsSP.CustomAccControl.Mode.custom if custom_enabled else structs.CarParamsSP.CustomAccControl.Mode.disabled
+  CP_SP.customAccControl.increments.shortIncrement = short_inc
+  CP_SP.customAccControl.increments.longIncrement = long_inc
+
+
+def get_init_params(params) -> list[dict[str, str]]:
+  keys: list = [
+    "HyundaiLongitudinalTuning",
+    "LongTuningCustomToggle",
+    "LongTuningVEgoStopping",
+    "LongTuningVEgoStarting",
+    "LongTuningStoppingDecelRate",
+    "LongTuningLongitudinalActuatorDelay",
+    "LongTuningMinUpperJerk",
+    "LongTuningMinLowerJerk",
+    "LongTuningJerkLimits",
+    "LongTuningLookaheadJerkBp",
+    "LongTuningLookaheadJerkUpperV",
+    "LongTuningLookaheadJerkLowerV",
+    "LongTuningUpperJerkV",
+    "LongTuningLowerJerkV",
+  ]
+
+  return [{k: params.get(k, encoding='utf8') or "0"} for k in keys]
