@@ -18,6 +18,11 @@ SoftwarePanelSP::SoftwarePanelSP(QWidget *parent) : SoftwarePanel(parent) {
         searchBranches(d.text());
       }
   });
+
+  // add update button
+  updateBtn = new ButtonControlSP(tr("Force Update"), tr("UPDATE"), tr(""));
+  connect(updateBtn, &ButtonControlSP::clicked, this, &SoftwarePanelSP::triggerUpdate);
+  addItem(updateBtn);
 }
 
 /**
@@ -48,4 +53,20 @@ void SoftwarePanelSP::searchBranches(const QString &query) {
     targetBranchBtn->setValue(selected_branch);
     checkForUpdates();
   }
+}
+
+void SoftwarePanelSP::triggerUpdate() {
+  QString message = tr("Are you sure you want to force an update?\n\nOpenpilot will restart.");
+  if (ConfirmationDialog::confirm(message, tr("Update"), this))
+  {
+    std::string cmd = "op switch " + params.get("UpdaterTargetBranch") + " && op start";
+    std::system(cmd.c_str());
+    // openpilot will restart if the process is successful. If not, show an error dialog.
+    ConfirmationDialog::alert(tr("Failed to apply updates."), this);
+  }
+}
+
+void SoftwarePanelSP::showEvent(QShowEvent *event) {
+  SoftwarePanel::showEvent(event);
+  updateBtn->setEnabled(params.getBool("IsOffroad"));
 }

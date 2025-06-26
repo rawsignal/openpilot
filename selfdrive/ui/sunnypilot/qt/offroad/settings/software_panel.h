@@ -19,4 +19,8 @@ public:
 
 private:
   void searchBranches(const QString &query);
+  void triggerUpdate();
+  void showEvent(QShowEvent *event) override;
+
+  ButtonControlSP *updateBtn;
 };
