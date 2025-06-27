@@ -4,8 +4,8 @@ class WMACConstants:
   LEAD_PROB = 0.45  # Balanced threshold for lead detection
 
   # Slow down detection parameters
-  SLOW_DOWN_WINDOW_SIZE = 5  # Responsive but stable
-  SLOW_DOWN_PROB = 0.3  # Balanced threshold for slow down scenarios
+  SLOW_DOWN_WINDOW_SIZE = 7  # Responsive but stable
+  SLOW_DOWN_PROB = 0.5  # Balanced threshold for slow down scenarios
 
   # Optimized slow down distance curve - smooth and progressive
   SLOW_DOWN_BP = [0., 10., 20., 30., 40., 50., 55., 60.]

@@ -99,7 +99,7 @@ class ModeTransitionManager:
     self.current_mode = 'acc'
     self.mode_confidence = {'acc': 1.0, 'blended': 0.0}
     self.transition_timeout = 0
-    self.min_mode_duration = 10
+    self.min_mode_duration = 25
     self.mode_duration = 0
     self.emergency_override = False
 
@@ -438,17 +438,6 @@ class DynamicExperimentalController:
       self._mode_manager.request_mode('blended', confidence=1.0, emergency=True)
       return
 
-    # If lead detected and not in standstill: always use ACC
-    if self._has_lead_filtered and not (self._standstill_count > 3):
-      if lead_one.status:
-        # Lead vehicle detected
-        if self._v_ego_kph < 25.0:
-          self._mode_manager.request_mode('blended', confidence=0.9)
-          return
-        else:
-          self._mode_manager.request_mode('acc', confidence=0.9)
-          return
-
     # Slow down scenarios: emergency for high urgency, normal for lower urgency
     if self._has_slow_down:
       if self._urgency > 0.7:
@@ -460,16 +449,27 @@ class DynamicExperimentalController:
         self._mode_manager.request_mode('blended', confidence=confidence)
       return
 
+    # If lead detected and not in standstill: always use ACC
+    if self._has_lead_filtered and not (self._standstill_count > 3):
+      if lead_one.status:
+        # Lead vehicle detected
+        if self._v_ego_kph < 25.0:
+          self._mode_manager.request_mode('blended', confidence=0.9)
+          return
+        else:
+          self._mode_manager.request_mode('acc', confidence=0.9)
+          return
+
     # Standstill: use blended
     if self._standstill_count > 3:
       self._mode_manager.request_mode('blended', confidence=0.9)
       return
 
     # High curvature at speed: use blended
-    if self._high_curvature and self._v_ego_kph > 45.0:
-      confidence = min(1.0, self._curvature * 12.0)
-      self._mode_manager.request_mode('blended', confidence=confidence)
-      return
+    # if self._high_curvature and self._v_ego_kph > 45.0:
+    #   confidence = min(1.0, self._curvature * 12.0)
+    #   self._mode_manager.request_mode('blended', confidence=confidence)
+    #   return
 
     # Driving slow: use ACC (but not if actively slowing down)
     if self._has_slowness and not self._has_slow_down:
