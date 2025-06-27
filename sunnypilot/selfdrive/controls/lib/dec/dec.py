@@ -161,7 +161,7 @@ class DynamicExperimentalController:
     # Mode transition manager
     self._mode_manager = ModeTransitionManager()
 
-    # Smooth filters for stable decision making with faster response for critical scenarios
+    # Smooth filters for stable decision-making with faster response for critical scenarios
     self._lead_filter = SmoothKalmanFilter(
       measurement_noise=0.15,
       process_noise=0.05,
@@ -384,7 +384,8 @@ class DynamicExperimentalController:
     self._has_slow_down = urgency_filtered > (WMACConstants.SLOW_DOWN_PROB * 0.8)
     self._urgency = urgency_filtered
 
-  def _radarless_mode(self) -> None:
+  def _radarless_mode(self, sm: messaging.SubMaster) -> None:
+    lead_one = sm['radarState'].leadOne
     """Radarless mode decision logic with emergency handling."""
 
     # EMERGENCY: MPC FCW - immediate blended mode
@@ -408,6 +409,12 @@ class DynamicExperimentalController:
         self._mode_manager.request_mode('blended', confidence=confidence)
       return
 
+    if lead_one.status:
+      # Lead vehicle detected
+      if self._v_ego_kph < 25.0:
+        self._mode_manager.request_mode('blended', confidence=0.9)
+        return
+
     # High curvature at speed: use blended
     if self._high_curvature and self._v_ego_kph > 40.0:
       confidence = min(1.0, self._curvature * 15.0)
@@ -422,7 +429,8 @@ class DynamicExperimentalController:
     # Default: ACC
     self._mode_manager.request_mode('acc', confidence=0.7)
 
-  def _radar_mode(self) -> None:
+  def _radar_mode(self, sm: messaging.SubMaster) -> None:
+    lead_one = sm['radarState'].leadOne
     """Radar mode with emergency handling."""
 
     # EMERGENCY: MPC FCW - immediate blended mode
@@ -432,8 +440,14 @@ class DynamicExperimentalController:
 
     # If lead detected and not in standstill: always use ACC
     if self._has_lead_filtered and not (self._standstill_count > 3):
-      self._mode_manager.request_mode('acc', confidence=1.0)
-      return
+      if lead_one.status:
+        # Lead vehicle detected
+        if self._v_ego_kph < 25.0:
+          self._mode_manager.request_mode('blended', confidence=0.9)
+          return
+        else:
+          self._mode_manager.request_mode('acc', confidence=0.9)
+          return
 
     # Slow down scenarios: emergency for high urgency, normal for lower urgency
     if self._has_slow_down:
@@ -474,9 +488,9 @@ class DynamicExperimentalController:
     self._update_calculations(sm)
 
     if self._CP.radarUnavailable:
-      self._radarless_mode()
+      self._radarless_mode(sm)
     else:
-      self._radar_mode()
+      self._radar_mode(sm)
 
     self._mode_manager.update()
     self._active = sm['selfdriveState'].experimentalMode and self._enabled
