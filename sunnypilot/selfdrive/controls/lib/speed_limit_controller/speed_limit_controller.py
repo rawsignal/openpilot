@@ -168,7 +168,7 @@ class SpeedLimitController:
 
   def _read_policy_param(self) -> Policy:
     try:
-      return Policy(int(self._params.get("SpeedLimitControlPolicy", encoding='utf8')))
+      return Policy(int(self._params.get("SpeedLimitControlPolicy")))
     except (ValueError, TypeError):
       return Policy.car_state_priority
 
@@ -180,7 +180,7 @@ class SpeedLimitController:
 
   def _read_int_param(self, key: str, default: int = 0, validator: Callable[[int], int] = None) -> int:
     try:
-      val = int(self._params.get(key, encoding='utf8'))
+      val = int(self._params.get(key))
 
       if validator is not None:
         return validator(val)
