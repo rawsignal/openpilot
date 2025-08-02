@@ -197,22 +197,22 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BackupManager_RestoreVersion", {PERSISTENT, STRING}},
 
     // sunnypilot car specific params
-    {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
+    {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, STRING, "0"}},
 
     // Hyundai Longitudinal Tuning Live Parameters
-    {"LongTuningCustomToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"LongTuningVEgoStopping", {PERSISTENT | BACKUP, FLOAT, "0.25"}},
-    {"LongTuningVEgoStarting", {PERSISTENT | BACKUP, FLOAT, "0.10"}},
-    {"LongTuningStoppingDecelRate", {PERSISTENT | BACKUP, FLOAT, "0.40"}},
+    {"LongTuningCustomToggle", {PERSISTENT | BACKUP, STRING, "0"}},
+    {"LongTuningVEgoStopping", {PERSISTENT | BACKUP, STRING, "0.25"}},
+    {"LongTuningVEgoStarting", {PERSISTENT | BACKUP, STRING, "0.10"}},
+    {"LongTuningStoppingDecelRate", {PERSISTENT | BACKUP, STRING, "0.40"}},
     {"LongTuningLookaheadJerkBp", {PERSISTENT | BACKUP, STRING, "2.0,5.0,20.0"}},
     {"LongTuningLookaheadJerkUpperV", {PERSISTENT | BACKUP, STRING, "0.25,0.5,1.0"}},
     {"LongTuningLookaheadJerkLowerV", {PERSISTENT | BACKUP, STRING, "0.05,0.10,0.3"}},
-    {"LongTuningLongitudinalActuatorDelay", {PERSISTENT | BACKUP, FLOAT, "0.45"}},
-    {"LongTuningJerkLimits", {PERSISTENT | BACKUP, FLOAT, "4.0"}},
+    {"LongTuningLongitudinalActuatorDelay", {PERSISTENT | BACKUP, STRING, "0.45"}},
+    {"LongTuningJerkLimits", {PERSISTENT | BACKUP, STRING, "4.0"}},
     {"LongTuningUpperJerkV", {PERSISTENT | BACKUP, STRING, "2.0,2.0,1.2"}},
     {"LongTuningLowerJerkV", {PERSISTENT | BACKUP, STRING, "3.0, 3.0,2.5"}},
-    {"LongTuningMinUpperJerk", {PERSISTENT | BACKUP, FLOAT, "0.5"}},
-    {"LongTuningMinLowerJerk", {PERSISTENT | BACKUP, FLOAT, "0.5"}},
+    {"LongTuningMinUpperJerk", {PERSISTENT | BACKUP, STRING, "0.5"}},
+    {"LongTuningMinLowerJerk", {PERSISTENT | BACKUP, STRING, "0.5"}},
 
     // Dynamic Experimental Controller
     {"DynamicExperimentalControl", {PERSISTENT | BACKUP, BOOL, "0"}},
