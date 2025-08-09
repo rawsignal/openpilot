@@ -90,7 +90,7 @@ class SelfdriveD(CruiseHelper):
     self.calibrator = PoseCalibrator()
 
     # Setup sockets
-    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP', 'userFlag'])
+    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP'])
 
     self.gps_location_service = get_gps_location_service(self.params)
     self.gps_packets = [self.gps_location_service]
@@ -110,7 +110,7 @@ class SelfdriveD(CruiseHelper):
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'liveCalibration',
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'livePose', 'liveDelay',
                                    'managerState', 'liveParameters', 'radarState', 'liveTorqueParameters',
-                                   'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userFlag'] + \
+                                   'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark', 'audioFeedback'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
                                   ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
@@ -119,8 +119,6 @@ class SelfdriveD(CruiseHelper):
     self.is_metric = self.params.get_bool("IsMetric")
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
-
-    self.custom_button_mapping = self.params.get("SteeringCustomButtonMapping")
 
     car_recognized = self.CP.brand != 'mock'
 
@@ -211,9 +209,12 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.selfdriveInitializing)
       return
 
-    # Check for user flag (bookmark) press
-    if self.sm.updated['userFlag']:
-      self.events.add(EventName.userFlag)
+    # Check for user bookmark press (bookmark button or end of LKAS button feedback)
+    if self.sm.updated['userBookmark']:
+      self.events.add(EventName.userBookmark)
+
+    if self.sm.updated['audioFeedback']:
+      self.events.add(EventName.audioFeedback)
 
     # Don't add any more events while in dashcam mode
     if self.CP.passive:
@@ -567,15 +568,6 @@ class SelfdriveD(CruiseHelper):
       self.pm.send('onroadEventsSP', ce_send_sp)
     self.events_sp_prev = self.events_sp.names.copy()
 
-    # custom button handling for bookmark
-    custom_pressed = any(be.type == ButtonTypeSP.customButton for be in CS_SP.buttonEvents)
-    if custom_pressed:
-      # 0 = Off
-      # 1 = bookmark
-      if self.custom_button_mapping == 1:
-        uf_msg = messaging.new_message('userFlag', valid=True)
-        self.pm.send('userFlag', uf_msg)
-
   def step(self):
     CS, CS_SP = self.data_sample()
     self.update_events(CS)
@@ -597,7 +589,6 @@ class SelfdriveD(CruiseHelper):
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
       self.personality = self.params.get("LongitudinalPersonality", return_default=True)
-      self.custom_button_mapping = self.params.get("SteeringCustomButtonMapping")
 
       self.mads.read_params()
       time.sleep(0.1)

@@ -3,10 +3,12 @@ import numpy as np
 from functools import cache
 import threading
 
-from cereal import messaging
+from cereal import messaging, custom
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.retry import retry
 from openpilot.common.swaglog import cloudlog
+
+from openpilot.common.params import Params
 
 RATE = 10
 FFT_SAMPLES = 1600 # 100ms
@@ -14,6 +16,7 @@ REFERENCE_SPL = 2e-5  # newtons/m^2
 SAMPLE_RATE = 16000
 SAMPLE_BUFFER = 800  # 50ms
 
+ButtonTypeSP = custom.CarStateSP.ButtonEvent.Type
 
 @cache
 def get_a_weighting_filter():
@@ -44,8 +47,10 @@ def apply_a_weighting(measurements: np.ndarray) -> np.ndarray:
 
 class Mic:
   def __init__(self):
+    self.params = Params()
     self.rk = Ratekeeper(RATE)
     self.pm = messaging.PubMaster(['soundPressure', 'rawAudioData'])
+    self.sm = messaging.SubMaster(['carStateSP', 'userBookmark'])
 
     self.measurements = np.empty(0)
 
@@ -54,8 +59,24 @@ class Mic:
     self.sound_pressure_level_weighted = 0
 
     self.lock = threading.Lock()
+    self.alwaysRecord = self.params.get("RecordAudio")
+    self.mute = not self.alwaysRecord
 
   def update(self):
+    print("micd update loop")
+    if not self.alwaysRecord:
+      self.sm.update()
+      if self.mute:
+        if self.sm.updated['carStateSP']:
+          for be in self.sm['carStateSP'].buttonEvents:
+            if be.type == ButtonTypeSP.customButton:
+              if be.pressed:
+                self.mute = False # Unmute on custom button press
+                print("micd unmuted - custom button pressed")
+      else:
+        if self.sm.updated['userBookmark']:
+          self.mute = True # Mute again when bookmark is sent
+          print("micd muted again")
     with self.lock:
       sound_pressure = self.sound_pressure
       sound_pressure_weighted = self.sound_pressure_weighted
@@ -76,6 +97,8 @@ class Mic:
 
     Logged A-weighted equivalents are rough approximations of the human-perceived loudness.
     """
+    if self.mute:
+      indata[:, 0] = 0  # Mute the input by zeroing out the samples
     msg = messaging.new_message('rawAudioData', valid=True)
     audio_data_int_16 = (indata[:, 0] * 32767).astype(np.int16)
     msg.rawAudioData.data = audio_data_int_16.tobytes()

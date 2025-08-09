@@ -194,7 +194,7 @@ int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct 
   return bytes_count;
 }
 
-void handle_user_flag(LoggerdState *s) {
+void handle_preserve_segment(LoggerdState *s) {
   static int prev_segment = -1;
   if (s->logger.segment() == prev_segment) return;
 
@@ -246,7 +246,7 @@ void loggerd_thread() {
         .counter = 0,
         .freq = it.decimation,
         .encoder = encoder,
-        .user_flag = it.name == "userFlag",
+        .user_flag = (it.name == "userBookmark") || (it.name == "audioFeedback"),
         .record_audio = record_audio,
       };
     }
@@ -282,7 +282,7 @@ void loggerd_thread() {
 
       ServiceState &service = service_state[sock];
       if (service.user_flag) {
-        handle_user_flag(&s);
+        handle_preserve_segment(&s);
       }
 
       // drain socket

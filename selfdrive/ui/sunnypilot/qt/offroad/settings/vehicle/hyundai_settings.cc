@@ -9,7 +9,7 @@
 
 HyundaiSettings::HyundaiSettings(QWidget *parent) : BrandSettingsInterface(parent) {
 
-  std::vector<QString> custom_btn_texts{ tr("Off"), tr("Bookmark") };
+  std::vector<QString> custom_btn_texts{ tr("Off"), tr("Bookmark"), tr("Audio Feedback") };
   customButtonMapping = new ButtonParamControlSP(
     "SteeringCustomButtonMapping",
     tr("Steering Custom ☆ Button"),

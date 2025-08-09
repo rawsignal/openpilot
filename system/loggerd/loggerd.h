@@ -107,7 +107,7 @@ const EncoderInfo qcam_encoder_info = {
   .encode_type = cereal::EncodeIndex::Type::QCAMERA_H264,
   .frame_width = 526,
   .frame_height = 330,
-  .include_audio = Params().getBool("RecordAudio"),
+  .include_audio = Params().getBool("RecordAudio") || (Params().get("SteeringCustomButtonMapping") == "2"),
   INIT_ENCODE_FUNCTIONS(QRoadEncode),
 };
 
