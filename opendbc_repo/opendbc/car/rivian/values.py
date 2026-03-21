@@ -75,10 +75,6 @@ RIVIAN_VERSION_REQUEST = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) + \
 RIVIAN_VERSION_RESPONSE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40])
 
 FW_QUERY_CONFIG = FwQueryConfig(
-  # EPS often absent on camera harness; FCM @ 0x72d (F191 part ID) is fwdCamera in FW_VERSIONS
-  non_essential_ecus={
-    Ecu.eps: [CAR.RIVIAN_R1_GEN1],
-  },
   requests=[
     Request(
       [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.SUPPLIER_SOFTWARE_VERSION_REQUEST],
