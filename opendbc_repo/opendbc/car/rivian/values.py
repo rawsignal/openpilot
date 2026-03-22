@@ -6,8 +6,6 @@ from opendbc.car.docs_definitions import CarHarness, CarDocs, CarParts
 from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries, p16
 from opendbc.car.vin import Vin
 
-Ecu = structs.CarParams.Ecu
-
 
 class WMI(StrEnum):
   RIVIAN_TRUCK = "7FC"
@@ -77,16 +75,23 @@ RIVIAN_VERSION_RESPONSE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40
 FW_QUERY_CONFIG = FwQueryConfig(
   requests=[
     Request(
+      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.SUPPLIER_SOFTWARE_VERSION_REQUEST],
+      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.SUPPLIER_SOFTWARE_VERSION_RESPONSE],
+      rx_offset=0x40,
+      bus=0,
+    ),
+    Request(
       [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.MANUFACTURER_ECU_HARDWARE_NUMBER_REQUEST],
       [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.MANUFACTURER_ECU_HARDWARE_NUMBER_RESPONSE],
       rx_offset=0x40,
-      bus=2,
+      bus=0,
+      logging=True,
     ),
     Request(
       [StdQueries.TESTER_PRESENT_REQUEST, RIVIAN_VERSION_REQUEST],
       [StdQueries.TESTER_PRESENT_RESPONSE, RIVIAN_VERSION_RESPONSE],
       rx_offset=0x40,
-      bus=2,
+      bus=0,
       logging=True,
     ),
   ],

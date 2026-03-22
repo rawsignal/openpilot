@@ -6,9 +6,9 @@ Ecu = CarParams.Ecu
 
 FW_VERSIONS = {
   CAR.RIVIAN_R1_GEN1: {
-    # FCM @ 0x72d (resp 0x76d); UDS F191 = manufacturer ECU hardware number / part ID (camera + ACM harness)
-    (Ecu.fwdCamera, 0x72d, None): [
-      b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffPT00000023-F.0-0000',
+    (Ecu.eps, 0x733, None): [
+      b'R1TS_v3.4.1(51),3.4.1\x00',
+      b'R1TS_v4.4.1(63),4.4.1\x00',
     ],
   },
 }
