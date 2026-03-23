@@ -68,21 +68,20 @@ def flash_panda(panda_serial: str) -> Panda:
   return panda
 
 
-def check_panda_support(panda_serials: list[str]) -> bool:
-  unsupported = []
+def check_panda_support(panda_serials: list[str]) -> list[str]:
+  spi_serials = set(Panda.spi_list())
+  for serial in panda_serials:
+    if serial in spi_serials:
+      return [serial]
+
   for serial in panda_serials:
     panda = Panda(serial)
-    hw_type = panda.get_type()
+    is_internal = panda.is_internal()
     panda.close()
-    if hw_type in Panda.SUPPORTED_DEVICES:
-      return True
+    if is_internal:
+      return [serial]
 
-    unsupported.append((serial, hw_type))
-
-  for serial, hw_type in unsupported:
-    cloudlog.warning(f"Panda {serial} is not supported (hw_type: {hw_type}), skipping...")
-
-  return False
+  return []
 
 
 def main() -> None:
@@ -134,28 +133,20 @@ def main() -> None:
 
       cloudlog.info(f"{len(panda_serials)} panda(s) found, connecting - {panda_serials}")
 
-      # Gate unsupported pandas before flashing (from master #1754)
-      if not check_panda_support(panda_serials):
-        continue
-
-      # Flash Rivian longitudinal upgrade kit first (master #1752), then
-      # flash internal panda and track it so an external enumerating first
-      # on USB does not get mistaken for the primary panda.
+      # custom flasher for xnor's Rivian Longitudinal Upgrade Kit
       flash_rivian_long(panda_serials)
 
-      panda = None
-      for serial in panda_serials:
-        p = Panda(serial)
-        if p.is_internal():
-          p.close()
-          panda = flash_panda(serial)
-          break
-        p.close()
+      # find the internal supported panda (e.g. skip external Black Panda)
+      panda_serials = check_panda_support(panda_serials)
+      if len(panda_serials) == 0:
+        continue
 
-      panda_serial = panda.get_usb_serial() if panda is not None else None
+      # Flash the first panda
+      panda_serial = panda_serials[0]
+      panda = flash_panda(panda_serial)
 
-      # Ensure internal panda is present if expected (master #1752)
-      if HARDWARE.has_internal_panda() and (panda is None or not panda.is_internal()):
+      # Ensure internal panda is present if expected
+      if HARDWARE.has_internal_panda() and not panda.is_internal():
         cloudlog.error("Internal panda is missing, trying again")
         no_internal_panda_count += 1
         continue
