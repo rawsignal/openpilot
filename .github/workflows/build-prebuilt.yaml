@@ -1,11 +1,12 @@
 name: Build Prebuilt
 
-
 env:
   BUILD_DIR: "/data/openpilot"
   OUTPUT_DIR: ${{ github.workspace }}/output
   SCONS_CACHE_DIR: ${{ github.workspace }}/release/ci/scons_cache
   SOURCE_BRANCH: "${{ github.head_ref || github.ref_name }}"
+  CACHEDB: "/data/cache/tinygrad/cache.db"
+  XDG_CACHE_HOME: "/data/cache"
 
 on:
   push:
@@ -36,12 +37,11 @@ jobs:
 
       - name: Set environment variables
         run: |
-            source /etc/profile
-            export UV_PROJECT_ENVIRONMENT=${HOME}/venv
-            export VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
-            export XDG_CACHE_HOME=/data/cache
-            mkdir -p /data/cache
-            printenv >> $GITHUB_ENV
+          source /etc/profile
+          export UV_PROJECT_ENVIRONMENT=${HOME}/venv
+          export VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
+          mkdir -p /data/cache/tinygrad
+          printenv >> $GITHUB_ENV
 
       - name: Setup build environment
         run: |
