@@ -1,6 +1,5 @@
 name: Build Prebuilt
 
-
 env:
   BUILD_DIR: "/data/openpilot"
   OUTPUT_DIR: ${{ github.workspace }}/output
@@ -35,11 +34,13 @@ jobs:
             scons-${{ runner.os }}-${{ runner.arch }}
 
       - name: Set environment variables
-        run: |
-          source /etc/profile
-          export UV_PROJECT_ENVIRONMENT=${HOME}/venv
-          export VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
-          printenv >> $GITHUB_ENV
+          run: |
+            source /etc/profile
+            export UV_PROJECT_ENVIRONMENT=${HOME}/venv
+            export VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
+            export XDG_CACHE_HOME=/data/cache
+            mkdir -p /data/cache
+            printenv >> $GITHUB_ENV
 
       - name: Setup build environment
         run: |
