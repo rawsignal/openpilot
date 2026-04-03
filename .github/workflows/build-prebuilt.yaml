@@ -35,7 +35,7 @@ jobs:
             scons-${{ runner.os }}-${{ runner.arch }}
 
       - name: Set environment variables
-          run: |
+        run: |
             source /etc/profile
             export UV_PROJECT_ENVIRONMENT=${HOME}/venv
             export VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
