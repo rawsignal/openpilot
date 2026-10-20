@@ -83,7 +83,9 @@ class TestHarnessDetection(unittest.TestCase):
       cp = _get_cp(long_kit=long_kit)
       cp_sp = CarInterface.get_params_sp(cp, CAR.RIVIAN_R1, _fp(long_kit=long_kit), [], alpha_long=False, is_release_sp=False, docs=False)
       self.assertEqual(bool(cp_sp.flags & RivianFlagsSP.LONGITUDINAL_HARNESS_UPGRADE), long_kit)
-      self.assertEqual(cp.alphaLongitudinalAvailable, long_kit)
+      # upstream "Rivian Gen 1: enable alpha longitudinal": every Gen 1 truck offers it, kit or not
+      self.assertTrue(cp.alphaLongitudinalAvailable)
+    self.assertFalse(_get_cp(gen2=True).alphaLongitudinalAvailable)
 
 
 def _mock_cs(cp, gen2=False, v_ego=10.0, eac_status=1):
