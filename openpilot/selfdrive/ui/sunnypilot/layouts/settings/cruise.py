@@ -76,8 +76,13 @@ class CruiseLayout(Widget):
     self.acceleration_control_toggle = toggle_item_sp(
       title=tr("Acceleration Control"),
       # Keep a literal so the AST translation extractor sees the complete message.
-      description=tr('Adds a personality-linked increase to the model acceleration candidate: Relaxed 0.1, Standard 0.2, Aggressive 0.3 m/s^2 at full activation. No increase at raw model requests <= 0; ramps to full at 0.1 m/s^2. Speed activation ramps from zero at 10 mph to full at 20 mph. No increase when the model predicts a stop. The separate gas override is unchanged. Cruise and lead candidates and acceleration limits still constrain the planner. Can only be changed while parked.'),  # noqa: E501
+      description=tr('Adds a personality-linked increase to the model acceleration candidate: Relaxed 0.1, Standard 0.2, Aggressive 0.3 m/s^2 at full activation. No increase at raw model requests <= 0; ramps to full at 0.1 m/s^2. Speed activation ramps from zero at 10 mph to full at 20 mph. No increase when the model predicts a stop. The separate gas override is unchanged. Acceleration Boost stays off while this is on. Cruise and lead candidates and acceleration limits still constrain the planner. Can only be changed while parked.'),  # noqa: E501
       param="AccelerationControl")
+    self.accel_boost_toggle = toggle_item_sp(
+      title=tr("Acceleration Boost"),
+      description=tr("Adds a small push on top of sunnypilot's own acceleration, stronger in Aggressive and gentler in Relaxed. " +
+                     "Eases off in curves and when sunnypilot slows or stops. Never goes past your set speed, and lead-car following still comes first."),
+      param="AccelBoostSP")
 
     self.custom_acc_toggle = toggle_item_sp(
       title=tr("Custom ACC Speed Increments"),
@@ -149,6 +154,7 @@ class CruiseLayout(Widget):
       self.scc_m_toggle,
       self.curve_speed_toggle,
       self.acceleration_control_toggle,
+      self.accel_boost_toggle,
       self.custom_acc_toggle,
       self.custom_acc_short_increment,
       self.custom_acc_long_increment,
@@ -203,6 +209,8 @@ class CruiseLayout(Widget):
           self.icbm_toggle.set_description(new_desc)
           self.icbm_toggle.show_description(True)
 
+      self.accel_boost_toggle.action_item.set_enabled(has_long and not ui_state.params.get_bool("AccelerationControl"))
+
       if has_long or has_icbm:
         self.custom_acc_toggle.action_item.set_enabled(((has_long and not ui_state.CP.pcmCruise) or has_icbm) and ui_state.is_offroad())
         self.scc_v_toggle.action_item.set_enabled(True)
@@ -231,7 +239,6 @@ class CruiseLayout(Widget):
 
       if not has_long:
         ui_state.params.remove("SPFollowingTimeOffset")
-        ui_state.params.remove("AccelerationControl")
         ui_state.params.remove("SPStopDistance")
         ui_state.params.remove("SPStopDistancePersonality")
 
@@ -243,6 +250,7 @@ class CruiseLayout(Widget):
     else:
       has_icbm = has_long = False
       self.icbm_toggle.action_item.set_enabled(False)
+      self.accel_boost_toggle.action_item.set_enabled(False)
       self.icbm_toggle.set_description(tr(ONROAD_ONLY_DESCRIPTION))
       self.rivian_resume_toggle.action_item.set_enabled(False)
       self.following_time_offset.action_item.set_enabled(False)

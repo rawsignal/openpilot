@@ -2,9 +2,6 @@
 
 #include "opendbc/safety/declarations.h"
 
-// Forward declaration: defined in safety.h, included after mode headers
-static void stock_ecu_check(bool stock_ecu_detected);
-
 static uint8_t rivian_get_counter(const CANPacket_t *msg) {
   // Signal: ESP_Status_Counter, VDM_PropStatus_Counter, VDM_AdasStatus_Counter
   return msg->data[1] & 0xFU;
@@ -126,16 +123,13 @@ static void rivian_rx_hook(const CANPacket_t *msg) {
     brake_pressed = (msg->data[2] >> 7) & 1U;
   }
 
-  // Cruise state. With enhanced MADS it also drives mads_state_update() via stock_ecu_check
-  // so that controls_allowed_lateral is updated every time ACM_Status arrives (100 Hz).
+  // Cruise state. safety.h runs mads_state_update() on every RX, so controls_allowed_lateral
+  // follows this message without anything here.
   // acc_main_on is left false: lateral is not tied to ACC state, allowing Mode B
   // (MADS active without ACC) to work correctly for Keep Active / Pause modes.
   if (msg_matches(msg, 0x100U, 2U)) {
     const int feature_status = msg->data[2] >> 5U;
     pcm_cruise_check(feature_status == 1);
-    if (rivian_enhanced_mads) {
-      stock_ecu_check(false);
-    }
   }
 }
 

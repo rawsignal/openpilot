@@ -10,6 +10,8 @@ from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
+from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_boost import AccelBoostSP
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
@@ -30,6 +32,8 @@ class LongitudinalPlannerSP:
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
+    self.accel_boost_sp = AccelBoostSP()
+    self.openpilot_longitudinal = CP.openpilotLongitudinalControl
 
     self.output_v_target = 0.
     self.output_a_target = 0.
@@ -105,6 +109,14 @@ class LongitudinalPlannerSP:
     return self.output_v_target, self.output_a_target
 
   def update(self, sm: messaging.SubMaster) -> None:
+    if self.accel_boost_sp.update_params():
+      self.accel_boost = self.accel_boost_sp if self.accel_boost_sp.enabled and self.openpilot_longitudinal else AccelBoost()
+
+    # Acceleration Control and upstream's predictive Acceleration Boost both lift the model's acceleration, and
+    # their lifts add. Acceleration Control wins: while it is on, keep comma's gas override boost instead.
+    if self.acceleration_control.enabled and self.accel_boost is self.accel_boost_sp:
+      self.accel_boost = AccelBoost()
+
     self.events_sp.clear()
     self.e2e_alerts_helper.update(sm, self.events_sp)
 
