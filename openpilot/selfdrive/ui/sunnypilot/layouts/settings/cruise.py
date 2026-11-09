@@ -239,7 +239,6 @@ class CruiseLayout(Widget):
 
       if not has_long:
         ui_state.params.remove("SPFollowingTimeOffset")
-        ui_state.params.remove("AccelerationControl")
         ui_state.params.remove("SPStopDistance")
         ui_state.params.remove("SPStopDistancePersonality")
 
