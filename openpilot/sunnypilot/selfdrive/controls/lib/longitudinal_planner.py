@@ -112,6 +112,11 @@ class LongitudinalPlannerSP:
     if self.accel_boost_sp.update_params():
       self.accel_boost = self.accel_boost_sp if self.accel_boost_sp.enabled and self.openpilot_longitudinal else AccelBoost()
 
+    # Acceleration Control and upstream's predictive Acceleration Boost both lift the model's acceleration, and
+    # their lifts add. Acceleration Control wins: while it is on, keep comma's gas override boost instead.
+    if self.acceleration_control.enabled and self.accel_boost is self.accel_boost_sp:
+      self.accel_boost = AccelBoost()
+
     self.events_sp.clear()
     self.e2e_alerts_helper.update(sm, self.events_sp)
 

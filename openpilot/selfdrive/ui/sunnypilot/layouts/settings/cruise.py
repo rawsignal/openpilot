@@ -76,7 +76,7 @@ class CruiseLayout(Widget):
     self.acceleration_control_toggle = toggle_item_sp(
       title=tr("Acceleration Control"),
       # Keep a literal so the AST translation extractor sees the complete message.
-      description=tr('Adds a personality-linked increase to the model acceleration candidate: Relaxed 0.1, Standard 0.2, Aggressive 0.3 m/s^2 at full activation. No increase at raw model requests <= 0; ramps to full at 0.1 m/s^2. Speed activation ramps from zero at 10 mph to full at 20 mph. No increase when the model predicts a stop. The separate gas override is unchanged. Cruise and lead candidates and acceleration limits still constrain the planner. Can only be changed while parked.'),  # noqa: E501
+      description=tr('Adds a personality-linked increase to the model acceleration candidate: Relaxed 0.1, Standard 0.2, Aggressive 0.3 m/s^2 at full activation. No increase at raw model requests <= 0; ramps to full at 0.1 m/s^2. Speed activation ramps from zero at 10 mph to full at 20 mph. No increase when the model predicts a stop. The separate gas override is unchanged. Acceleration Boost stays off while this is on. Cruise and lead candidates and acceleration limits still constrain the planner. Can only be changed while parked.'),  # noqa: E501
       param="AccelerationControl")
     self.accel_boost_toggle = toggle_item_sp(
       title=tr("Acceleration Boost"),
@@ -209,7 +209,7 @@ class CruiseLayout(Widget):
           self.icbm_toggle.set_description(new_desc)
           self.icbm_toggle.show_description(True)
 
-      self.accel_boost_toggle.action_item.set_enabled(has_long)
+      self.accel_boost_toggle.action_item.set_enabled(has_long and not ui_state.params.get_bool("AccelerationControl"))
 
       if has_long or has_icbm:
         self.custom_acc_toggle.action_item.set_enabled(((has_long and not ui_state.CP.pcmCruise) or has_icbm) and ui_state.is_offroad())
