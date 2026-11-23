@@ -254,6 +254,9 @@ class TestRivianHarnessEligibility(unittest.TestCase):
       def get_bool(self, key):
         return False
 
+      def get(self, key, return_default=False):
+        return {"CustomAccShortPressIncrement": 1, "CustomAccLongPressIncrement": 5}.get(key)
+
     # Environment seam: only the unrelated persisted resume preference is off.
     # The BSM parser, CAN packer and state extension execute their actual code.
     params_module = types.ModuleType('openpilot.common.params')

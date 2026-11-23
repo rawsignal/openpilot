@@ -23,6 +23,18 @@ sections:
     enablement:
     - $ref: '#/macros/offroad'
     - $ref: '#/macros/longitudinal'
+  - key: RivianGen2WheelMapping
+    widget: toggle
+    title: 'Rivian: Gen 2 Wheel Controls'
+    description: >-
+      Use the right scroll wheel for set speed (one detent per step; a fast
+      scroll jumps by the long-press step) and the right wheel's left and right
+      buttons for driving personality, like Gen 2 Rivians. Off: the buttons set
+      speed and the scroll wheel changes personality. Takes effect after going
+      offroad.
+    enablement:
+    - $ref: '#/macros/offroad'
+    - $ref: '#/macros/longitudinal'
   - key: RivianOfftrackCompensationEnabled
     widget: toggle
     title: Rear-Axle Off-Tracking Compensation

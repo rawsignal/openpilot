@@ -26,6 +26,11 @@ class TogglesLayoutMici(NavScroller):
                                                description="A small extra push on sunnypilot's own acceleration.\n" +
                                                            "Stronger in Aggressive, gentler in Relaxed.\n" +
                                                            "Eases off in curves and when slowing or stopping.")
+    self._rivian_gen2_wheel_toggle = BigParamControl("rivian gen 2 wheel controls", "RivianGen2WheelMapping",
+                                                     description="Use the right scroll wheel for set speed (one detent per step; " +
+                                                                 "a fast scroll jumps by the long-press step) and the right wheel's left and right " +
+                                                                 "buttons for driving personality, like Gen 2 Rivians. Off: the buttons set speed " +
+                                                                 "and the scroll wheel changes personality. Takes effect after going offroad.")
     is_metric_toggle = BigToggle("use metric units", initial_state=ui_state.params.get_bool("IsMetric"), toggle_callback=self._on_metric_toggle)
     ldw_toggle = BigParamControl("lane departure warnings", "IsLdwEnabled",
                                  description="Warn when you drift across a detected lane line.\n" +
@@ -49,6 +54,7 @@ class TogglesLayoutMici(NavScroller):
       self._initial_cruise_speed,
       self._curve_speed_toggle,
       self._accel_boost_toggle,
+      self._rivian_gen2_wheel_toggle,
       is_metric_toggle,
       ldw_toggle,
       always_on_dm_toggle,
@@ -62,6 +68,7 @@ class TogglesLayoutMici(NavScroller):
     self._refresh_toggles = (
       ("CurveSpeedControl", self._curve_speed_toggle),
       ("AccelBoostSP", self._accel_boost_toggle),
+      ("RivianGen2WheelMapping", self._rivian_gen2_wheel_toggle),
       ("IsMetric", is_metric_toggle),
       ("IsLdwEnabled", ldw_toggle),
       ("AlwaysOnDM", always_on_dm_toggle),
@@ -109,6 +116,8 @@ class TogglesLayoutMici(NavScroller):
       long_avail = ui_state.has_longitudinal_control
       for w in (self._personality_toggle, self._curve_speed_toggle, self._accel_boost_toggle):
         w.set_visible(long_avail)
+      self._rivian_gen2_wheel_toggle.set_visible(long_avail and ui_state.CP.brand == "rivian")
+      self._rivian_gen2_wheel_toggle.set_enabled(lambda: ui_state.is_offroad())
 
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
