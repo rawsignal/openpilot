@@ -89,8 +89,7 @@ jobs:
           mkdir -p /tmp/agnos
           if [ ! -f /tmp/agnos/system.img ]; then
             curl -fSL --retry 5 --retry-delay 5 -o /tmp/agnos/system.img.xz "${{ steps.agnos.outputs.url }}"
-            xz -d -T0 /tmp/agnos/system.img.xz
-            rm /tmp/agnos/system.img.xz
+            xz -d -T0 /tmp/agnos/system.img.xz   # -d removes the .xz on success
           fi
           # Hash semantics (openpilot/common/hardware/comma/agnos.py, StreamingDecompressor +
           # extract_compressed_image): hash = sha256 of the DECOMPRESSED (still-sparse) image,
