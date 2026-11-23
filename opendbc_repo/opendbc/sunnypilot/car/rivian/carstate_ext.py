@@ -20,34 +20,6 @@ ButtonType = structs.CarState.ButtonEvent.Type
 MAX_SET_SPEED = 85 * CV.MPH_TO_MS
 MIN_SET_SPEED = 20 * CV.MPH_TO_MS
 
-# Right scroll wheel (WheelButtons_Fwd RightButton_Scroll): an 8-bit position counter, one step per detent,
-# wrapping 255 <-> 0, sent at 20 Hz. Measured on an R1T (2026-11-23 capture): the counter counts up when the wheel
-# is scrolled up; deliberate single detents came 1 s or more apart, while a quick flick is 2-3 detents within about
-# 50 ms, often several in one message.
-SCROLL_UP_SIGN = 1          # +1: the counter increases when the wheel is scrolled up (toward faster)
-SCROLL_MAX_STEP = 8         # ignore a jump larger than this in one frame (counter reset / bad frame)
-FAST_SCROLL_DETENTS = 2     # this many detents in one burst makes it a fast scroll
-SCROLL_BURST_GAP_FRAMES = 20  # 0.2 s at the 100 Hz carstate rate without a detent ends a burst
-LONG_PRESS_FRAMES = 66      # existing hold-to-repeat period for the set-speed buttons
-
-
-class WheelSettings:
-  def __init__(self, gen2_mapping: bool = False, custom_increments: bool = False,
-               short_increment: int = 1, long_increment: int = 5):
-    self.gen2_mapping = gen2_mapping
-    self.custom_increments = custom_increments
-    self.short_increment = max(1, int(short_increment))
-    self.long_increment = max(1, int(long_increment))
-
-  @staticmethod
-  def from_params(params) -> "WheelSettings":
-    return WheelSettings(
-      gen2_mapping=params.get_bool("RivianGen2WheelMapping"),
-      custom_increments=params.get_bool("CustomAccIncrementsEnabled"),
-      short_increment=params.get("CustomAccShortPressIncrement", return_default=True),
-      long_increment=params.get("CustomAccLongPressIncrement", return_default=True),
-    )
-
 
 class CarStateExt:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP):
@@ -67,7 +39,6 @@ class CarStateExt:
     from openpilot.common.params import Params
 
     self._resume_enabled: bool = Params().get_bool("RivianResumeEnabled")
-    self._init_wheel(WheelSettings.from_params(Params()))
     self.last_active_set_speed: float | None = None
     self._prev_cruise_enabled: bool = False
     self._resume_eligible: bool = False
@@ -75,16 +46,6 @@ class CarStateExt:
     self._prev_stalk_down2: bool = False
     self._prev_stalk_down: bool = False
     self._frames_since_acc_on: int = 0
-
-  def _init_wheel(self, settings: WheelSettings) -> None:
-    self.wheel = settings
-    self._frame = 0
-    self._scroll_last: int | None = None
-    self._burst = 0
-    self._burst_dir = 0
-    self._last_detent_frame = -10**6
-    self._personality_left_last = False
-    self._personality_right_last = False
 
   def update_stalk_controls(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> list:
     cp = can_parsers[Bus.pt]
@@ -131,40 +92,36 @@ class CarStateExt:
     prev_decrease_button = self.decrease_button
 
     if self.CP.openpilotLongitudinalControl:
-      self._frame += 1
+      # distance scroll wheel
+      right_scroll = cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"]
+      if right_scroll != 255:
+        if self.distance_button != right_scroll:
+          button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
+        self.distance_button = right_scroll
+
+      # button logic for set-speed
+      self.increase_button = cp_park.vl["WheelButtons_Fwd"]["RightButton_RightClick"] == 2
+      self.decrease_button = cp_park.vl["WheelButtons_Fwd"]["RightButton_LeftClick"] == 2
+
+      self.increase_counter = self.increase_counter + 1 if self.increase_button else 0
+      self.decrease_counter = self.decrease_counter + 1 if self.decrease_button else 0
+
       metric = cp_adas.vl["Cluster"]["Cluster_Unit"] == 0
       conversion = CV.KPH_TO_MS if metric else CV.MPH_TO_MS
-      right_scroll = int(cp_park.vl["WheelButtons_Fwd"]["RightButton_Scroll"])
-      left_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_LeftClick"] == 2
-      right_click = cp_park.vl["WheelButtons_Fwd"]["RightButton_RightClick"] == 2
+      long_press_step = 10.0 if metric else 5.0
+      set_speed_converted = self.set_speed * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
 
-      if self.wheel.gen2_mapping:
-        button_events.extend(self._update_gen2_wheel(right_scroll, left_click, right_click, metric, conversion))
-      else:
-        # distance scroll wheel
-        if right_scroll != 255:
-          if self.distance_button != right_scroll:
-            button_events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
-          self.distance_button = right_scroll
+      if self.increase_button:
+        if self.increase_counter % 66 == 0:
+          self.set_speed = (int(math.ceil((set_speed_converted + 1) / long_press_step)) * long_press_step) * conversion
+        elif not prev_increase_button:
+          self.set_speed += conversion
 
-        # button logic for set-speed
-        self.increase_button = right_click
-        self.decrease_button = left_click
-
-        self.increase_counter = self.increase_counter + 1 if self.increase_button else 0
-        self.decrease_counter = self.decrease_counter + 1 if self.decrease_button else 0
-
-        if self.increase_button:
-          if self.increase_counter % LONG_PRESS_FRAMES == 0:
-            self._step_speed(1, True, metric, conversion)
-          elif not prev_increase_button:
-            self._step_speed(1, False, metric, conversion)
-
-        if self.decrease_button:
-          if self.decrease_counter % LONG_PRESS_FRAMES == 0:
-            self._step_speed(-1, True, metric, conversion)
-          elif not prev_decrease_button:
-            self._step_speed(-1, False, metric, conversion)
+      if self.decrease_button:
+        if self.decrease_counter % 66 == 0:
+          self.set_speed = (int(math.floor((set_speed_converted - 1) / long_press_step)) * long_press_step) * conversion
+        elif not prev_decrease_button:
+          self.set_speed -= conversion
 
       # VDM_UserAdasRequest: 0=IDLE, 1=UP_1, 2=UP_2, 3=DOWN_1, 4=DOWN_2
       vdm_request = int(cp.vl["VDM_AdasSts"]["VDM_UserAdasRequest"])
@@ -229,57 +186,6 @@ class CarStateExt:
       ret.rightBlindspot = cp_park.vl["BSM_BlindSpotIndicator_Fwd"]["BSM_BlindSpotIndicator_Right"] != 0
 
     return button_events
-
-  def _short_step(self, metric: bool) -> int:
-    return self.wheel.short_increment if self.wheel.custom_increments else 1
-
-  def _long_step(self, metric: bool) -> float:
-    if self.wheel.custom_increments:
-      return float(self.wheel.long_increment)
-    return 10.0 if metric else 5.0
-
-  def _step_speed(self, direction: int, long: bool, metric: bool, conversion: float) -> None:
-    set_speed_converted = self.set_speed * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
-    if long:
-      step = self._long_step(metric)
-      if direction > 0:
-        self.set_speed = (int(math.ceil((set_speed_converted + 1) / step)) * step) * conversion
-      else:
-        self.set_speed = (int(math.floor((set_speed_converted - 1) / step)) * step) * conversion
-    else:
-      self.set_speed += direction * self._short_step(metric) * conversion
-
-  def _update_gen2_wheel(self, right_scroll: int, left_click: bool, right_click: bool,
-                         metric: bool, conversion: float) -> list:
-    events = []
-    # set-speed buttons are personality buttons here: one cycle step per release
-    if (self._personality_left_last and not left_click) or (self._personality_right_last and not right_click):
-      events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.gapAdjustCruise))
-    self._personality_left_last = left_click
-    self._personality_right_last = right_click
-    self.increase_button = self.decrease_button = False
-    self.increase_counter = self.decrease_counter = 0
-
-    # scroll wheel = set speed. Signed detents since last frame, across the 255 <-> 0 wrap.
-    if self._scroll_last is None:
-      self._scroll_last = right_scroll
-      return events
-    delta = ((right_scroll - self._scroll_last + 128) % 256) - 128
-    self._scroll_last = right_scroll
-    if delta == 0 or abs(delta) > SCROLL_MAX_STEP:
-      return events
-    direction = 1 if delta * SCROLL_UP_SIGN > 0 else -1
-    for _ in range(abs(delta)):
-      if direction != self._burst_dir or self._frame - self._last_detent_frame > SCROLL_BURST_GAP_FRAMES:
-        self._burst = 0
-        self._burst_dir = direction
-      self._burst += 1
-      self._last_detent_frame = self._frame
-      if self._burst < FAST_SCROLL_DETENTS:
-        self._step_speed(direction, False, metric, conversion)
-      elif (self._burst - FAST_SCROLL_DETENTS) % FAST_SCROLL_DETENTS == 0:
-        self._step_speed(direction, True, metric, conversion)
-    return events
 
   def update(self, ret: structs.CarState, can_parsers: dict[StrEnum, CANParser]) -> None:
     button_events = []

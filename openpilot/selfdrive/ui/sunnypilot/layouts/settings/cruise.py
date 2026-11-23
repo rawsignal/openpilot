@@ -142,11 +142,6 @@ class CruiseLayout(Widget):
       description=tr('When enabled a full stalk down action held for at least 0.5s, provided activation of ACC is available on stock Rivian, will set the cruise speed to be equal to that from the last time cruise was deactivated. If cruise has never been activated it will set the cruise speed to the current vehicle speed. It is recommended to disable the stock Rivian feature: "Set to speed limit on divided highways", which uses the same activation mechanism.'),  # noqa: E501
       param="RivianResumeEnabled")
 
-    self.rivian_gen2_wheel_toggle = toggle_item_sp(
-      title=tr("Rivian: Gen 2 Wheel Controls"),
-      description=tr("Use the right scroll wheel for set speed (one detent per step; a fast scroll jumps by the long-press step) and the right wheel's left and right buttons for driving personality, like Gen 2 Rivians. Off: the buttons set speed and the scroll wheel changes personality. Takes effect after going offroad."),  # noqa: E501
-      param="RivianGen2WheelMapping")
-
 
     items = [
       self.icbm_toggle,
@@ -161,7 +156,6 @@ class CruiseLayout(Widget):
       self.stop_distance_personality,
       self.following_time_offset,
       self.rivian_resume_toggle,
-      self.rivian_gen2_wheel_toggle,
       self.sla_settings_button,
     ]
     return items
@@ -242,10 +236,8 @@ class CruiseLayout(Widget):
 
       is_rivian_long = ui_state.CP.brand == "rivian" and has_long
       self.rivian_resume_toggle.action_item.set_enabled(is_rivian_long and ui_state.is_offroad())
-      self.rivian_gen2_wheel_toggle.action_item.set_enabled(is_rivian_long and ui_state.is_offroad())
       if not is_rivian_long:
         ui_state.params.remove("RivianResumeEnabled")
-        ui_state.params.remove("RivianGen2WheelMapping")
 
     else:
       has_icbm = has_long = False
@@ -253,7 +245,6 @@ class CruiseLayout(Widget):
       self.accel_boost_toggle.action_item.set_enabled(False)
       self.icbm_toggle.set_description(tr(ONROAD_ONLY_DESCRIPTION))
       self.rivian_resume_toggle.action_item.set_enabled(False)
-      self.rivian_gen2_wheel_toggle.action_item.set_enabled(False)
       self.following_time_offset.action_item.set_enabled(False)
       self.stop_distance_option.action_item.set_enabled(False)
       self.stop_distance_personality.action_item.set_enabled(False)
