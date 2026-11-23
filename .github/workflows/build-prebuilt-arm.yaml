@@ -89,17 +89,17 @@ jobs:
           mkdir -p /tmp/agnos
           if [ ! -f /tmp/agnos/system.img ]; then
             curl -fSL --retry 5 --retry-delay 5 -o /tmp/agnos/system.img.xz "${{ steps.agnos.outputs.url }}"
-            # hash = sha256 of the file at url (.xz); hash_raw = sha256 of the DECOMPRESSED image
-            # (semantics from openpilot/common/hardware/comma/agnos.py extract_compressed_image)
-            echo "${{ steps.agnos.outputs.hash }}  /tmp/agnos/system.img.xz" | sha256sum -c -
             xz -d -T0 /tmp/agnos/system.img.xz
             rm /tmp/agnos/system.img.xz
           fi
-          # always verify the image, even when restored from cache
-          echo "${{ steps.agnos.outputs.hash_raw }}  /tmp/agnos/system.img" | sha256sum -c -
+          # Hash semantics (openpilot/common/hardware/comma/agnos.py, StreamingDecompressor +
+          # extract_compressed_image): hash = sha256 of the DECOMPRESSED (still-sparse) image,
+          # hash_raw = sha256 of the UNSPARSIFIED raw image. No manifest hash for the .xz itself.
+          echo "${{ steps.agnos.outputs.hash }}  /tmp/agnos/system.img" | sha256sum -c -
           # sparse ext4 -> raw -> rootfs tree (e2cp reads the image directly, no loop mount needed)
           command -v unsimg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq e2fsprogs; }
           unsimg /tmp/agnos/system.img /tmp/agnos/system.raw.img
+          echo "${{ steps.agnos.outputs.hash_raw }}  /tmp/agnos/system.raw.img" | sha256sum -c -
           mkdir -p /tmp/agnos/rootfs
           sudo e2cp /tmp/agnos/system.raw.img /tmp/agnos/rootfs/
           rm /tmp/agnos/system.raw.img
