@@ -266,6 +266,9 @@ jobs:
           unset VIRTUAL_ENV
           mkdir -p /data/cache/tinygrad
           cd /workspace
+          # Runner checks out as uid 1001, the container runs as root -> git's
+          # dubious-ownership check rejects /workspace. release_files.py runs `git ls-files`.
+          git config --global --add safe.directory /workspace
           echo "=== disk at container start ==="; df -h /data /workspace 2>/dev/null || df -h
           # --extra tools: SConstruct imports bzip2/ncurses unconditionally (see 3X workflow comment)
           uv sync --frozen --extra tools --python /usr/local/venv/bin/python
