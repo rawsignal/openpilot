@@ -1,0 +1,361 @@
+name: Build Prebuilt (ARM test)
+
+# Test of the GitHub-hosted ARM runner option for prebuilt builds (replaces the self-hosted
+# comma 3X tici runner -- see E:\appcb\agnos_container_runner_research.md).
+#
+#   push to main -> build job on ubuntu-24.04-arm (GitHub-hosted, free for public repos, 4 vCPU)
+#                -> publish job (ubuntu-24.04) force-pushes main-pre in this repo
+#
+# The build runs inside a container imported from the AGNOS system image pinned by THIS branch
+# (openpilot/common/hardware/comma/agnos.json) -- i.e. the exact rootfs the device runs.
+# glibc/Python/venv/clang parity is therefore by construction. No QEMU: the runner itself is
+# arm64, so the container runs natively.
+#
+# Safety carried over from build-prebuilt.yaml (the proven 3X build):
+#   - LFS: release-manifest copy means .gitattributes never enters the tree + hard pointer-stub guard.
+#   - RUNPATH: build in /data/openpilot (the device's RUNTIME path) via a bind mount.
+#   - Same scons targets, same ffmpeg vendoring, same NEEDED-lib / LFS / size guards.
+#
+# Differences from the 3X build:
+#   - no powersave toggling (hosted runner, no device CPU governor to restore)
+#   - ephemeral $RUNNER_TEMP mounts instead of /data (no wipe/boot concerns; a fresh runner per job)
+#   - AGNOS image re-derived from the branch manifest each run (cached while the manifest is unchanged)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Branch to build (blank = the branch you run this from)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_BRANCH: ${{ github.event.inputs.source_branch || github.ref_name }}
+  BUILD_DIR: "/data/openpilot"  # MUST equal the device's runtime path (RUNPATH)
+  OUTPUT_DIR: ${{ github.workspace }}/output
+  SCONS_CACHE_DIR: ${{ github.workspace }}/release/ci/scons_cache
+  CACHEDB: "/data/cache/tinygrad/cache.db"
+  XDG_CACHE_HOME: "/data/cache"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: build-arm-${{ github.event.inputs.source_branch || github.ref_name }}
+      cancel-in-progress: false
+    outputs:
+      source_sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Checkout source branch (submodules + LFS)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ env.SOURCE_BRANCH }}
+
+      - name: LFS pull (guarantee real bytes, not pointers)
+        run: git lfs pull
+
+      - name: Record source commit
+        id: meta
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve AGNOS system image from branch manifest
+        id: agnos
+        run: |
+          MANIFEST=openpilot/common/hardware/comma/agnos.json
+          URL=$(jq -r '.[] | select(.name=="system") | .url' "$MANIFEST")
+          HASH=$(jq -r '.[] | select(.name=="system") | .hash' "$MANIFEST")
+          HASH_RAW=$(jq -r '.[] | select(.name=="system") | .hash_raw' "$MANIFEST")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "hash_raw=$HASH_RAW" >> "$GITHUB_OUTPUT"
+          echo "AGNOS_HASH=$HASH_RAW" >> "$GITHUB_ENV"
+          echo "AGNOS system image: $URL"
+
+      - name: Cache AGNOS system image
+        uses: actions/cache@v4
+        with:
+          path: /tmp/agnos/system.img
+          key: agnos-system-${{ steps.agnos.outputs.hash_raw }}
+
+      - name: Download + unpack AGNOS system image
+        run: |
+          set -e
+          mkdir -p /tmp/agnos
+          if [ ! -f /tmp/agnos/system.img ]; then
+            curl -fSL --retry 5 --retry-delay 5 -o /tmp/agnos/system.img.xz "${{ steps.agnos.outputs.url }}"
+            echo "${{ steps.agnos.outputs.hash_raw }}  /tmp/agnos/system.img.xz" | sha256sum -c -
+            xz -d -T0 /tmp/agnos/system.img.xz
+            rm /tmp/agnos/system.img.xz
+          fi
+          echo "${{ steps.agnos.outputs.hash }}  /tmp/agnos/system.img" | sha256sum -c -
+          # sparse ext4 -> raw -> rootfs tree (e2cp reads the image directly, no loop mount needed)
+          command -v unsimg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq e2fsprogs; }
+          unsimg /tmp/agnos/system.img /tmp/agnos/system.raw.img
+          mkdir -p /tmp/agnos/rootfs
+          sudo e2cp /tmp/agnos/system.raw.img /tmp/agnos/rootfs/
+          rm /tmp/agnos/system.raw.img
+
+      - name: Import rootfs as docker image (+ smoke test)
+        run: |
+          set -e
+          if ! command -v docker >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq docker.io
+            sudo systemctl enable --now docker
+          fi
+          tar -C /tmp/agnos/rootfs --numeric-owner -cf /tmp/agnos/rootfs.tar .
+          rm -rf /tmp/agnos/rootfs
+          # runner is arm64, so the imported image is linux/arm64 by default
+          docker import /tmp/agnos/rootfs.tar ap-agnos:local
+          rm /tmp/agnos/rootfs.tar
+          # 30-second smoke test: this container IS the device userspace
+          docker run --rm --platform linux/arm64 ap-agnos:local bash -lc '
+            echo "AGNOS: $(cat /VERSION)"
+            test -f /AGNOS && echo "/AGNOS present (SConstruct COMMA_HARDWARE path)"
+            /usr/local/venv/bin/python --version
+            clang --version | head -1
+            uv --version
+            rsync --version | head -1
+          '
+
+      - name: Cache SCons
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCONS_CACHE_DIR }}
+          key: scons-${{ runner.os }}-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ github.sha }}
+          restore-keys: |
+            scons-${{ runner.os }}-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}
+            scons-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache tinygrad
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cache
+          key: tgrad-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ env.AGNOS_HASH }}-${{ github.sha }}
+          restore-keys: |
+            tgrad-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ env.AGNOS_HASH }}
+            tgrad-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}
+
+      - name: Compute venv cache key
+        id: venvkey
+        run: echo "lockhash=$(git hash-object uv.lock)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache venv
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/venv
+          key: venv-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ env.AGNOS_HASH }}-${{ steps.venvkey.outputs.lockhash }}
+          restore-keys: |
+            venv-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ env.AGNOS_HASH }}
+
+      - name: Write in-container build script
+        run: |
+          # Quoted heredoc: no expansion by the runner shell. Uniform indentation is harmless
+          # (invoked as `bash /build.sh`, so the shebang line is just a comment).
+          cat > "${RUNNER_TEMP}/ap_build.sh" <<'APBUILD'
+          #!/bin/bash
+          set -euo pipefail
+
+          # --- environment (mirrors the 3X workflow's "Set environment variables") ---
+          export UV_PROJECT_ENVIRONMENT=/root/venv
+          unset VIRTUAL_ENV
+          mkdir -p /data/cache/tinygrad
+          cd /workspace
+          # --extra tools: SConstruct imports bzip2/ncurses unconditionally (see 3X workflow comment)
+          uv sync --frozen --extra tools --python /usr/local/venv/bin/python
+          export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT}"
+          export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+          # --- setup (mirrors "Setup build environment"; powersave dropped -- no device governor) ---
+          BUILD_DIR=/data/openpilot
+          find "${BUILD_DIR}" -mindepth 1 -delete 2>/dev/null || true
+
+          # --- build (same targets/flags as the 3X workflow) ---
+          export PYTHONPATH="${BUILD_DIR}"
+          # Copy only release-manifest files (this is why .gitattributes never enters the tree).
+          ./tools/release/release_files.py | tr '\n' '\0' | rsync -rRl --from0 --files-from=- . "${BUILD_DIR}/"
+          cd "${BUILD_DIR}"
+          sed -i '/from .board.jungle import PandaJungle, PandaJungleDFU/s/^/#/' panda/__init__.py
+
+          echo "Building sunnypilot's modeld_v2..."
+          scons -j"$(nproc)" cache_dir=/workspace/release/ci/scons_cache --minimal openpilot/sunnypilot/modeld_v2
+          echo "Building sunnypilot's locationd..."
+          scons -j2 cache_dir=/workspace/release/ci/scons_cache --minimal openpilot/sunnypilot/selfdrive/locationd
+          echo "Building openpilot's locationd..."
+          scons -j"$(nproc)" cache_dir=/workspace/release/ci/scons_cache --minimal openpilot/selfdrive/locationd
+          echo "Building rest of sunnypilot..."
+          scons -j"$(nproc)" cache_dir=/workspace/release/ci/scons_cache --minimal
+
+          # comma-deps-ffmpeg is a SHARED build: libav* RPATH points into THIS venv, a path no
+          # tester's device has. Ship the three libs next to the binaries ($ORIGIN is on their RPATH).
+          FFMPEG_LIB=$(python3 -c 'import ffmpeg; print(ffmpeg.LIB_DIR)')
+          echo "Vendoring ffmpeg libs from ${FFMPEG_LIB}"
+          cp -av "${FFMPEG_LIB}"/libavformat.so.* "${FFMPEG_LIB}"/libavcodec.so.* "${FFMPEG_LIB}"/libavutil.so.* \
+                 "${BUILD_DIR}/openpilot/system/loggerd/"
+          touch "${BUILD_DIR}/prebuilt"
+
+          # --- prepare output (same exclusions as the 3X workflow) ---
+          OUTPUT_DIR=/workspace/output
+          rm -rf "${OUTPUT_DIR}"
+          mkdir -p "${OUTPUT_DIR}"
+          rsync -am \
+            --exclude='.sconsign.dblite' \
+            --exclude='*.a' \
+            --exclude='*.o' \
+            --exclude='*.os' \
+            --exclude='*.pyc' \
+            --exclude='moc_*' \
+            --exclude='__pycache__' \
+            --exclude='Jenkinsfile' \
+            --exclude='**/release/' \
+            --exclude='**/.github/' \
+            --exclude='**/selfdrive/ui/replay/' \
+            --exclude='**/__pycache__/' \
+            --exclude='/workspace/release/ci/scons_cache' \
+            --exclude='**/.git/' \
+            --exclude='**/.gitattributes' \
+            --exclude='**/SConstruct' \
+            --exclude='**/SConscript' \
+            --exclude='**/.venv/' \
+            --exclude='openpilot/selfdrive/modeld/models/*driving*.onnx' \
+            --exclude='openpilot/third_party/*x86*' \
+            --exclude='openpilot/third_party/*Darwin*' \
+            --delete-excluded \
+            --chown=comma:comma \
+            "${BUILD_DIR}/" "${OUTPUT_DIR}/"
+
+          # --- guard: every shared lib the binaries need must be resolvable (verbatim from 3X workflow) ---
+          fail=0
+          while read -r bin; do
+            head -c 4 "$bin" | grep -q ELF || continue
+            d=$(dirname "$bin")
+            dirs=("$d")
+            for p in $(readelf -d "$bin" 2>/dev/null | grep -oP 'Library (runpath|rpath): \[\K[^]]+' | tr ':' '\n'); do
+              p=${p//\$ORIGIN/$d}
+              case "$p" in /data/openpilot/*) p="${OUTPUT_DIR}${p#/data/openpilot}" ;; esac
+              dirs+=("$p")
+            done
+            for need in $(readelf -d "$bin" 2>/dev/null | grep -oP 'Shared library: \[\K[^]]+'); do
+              case "$need" in
+                libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libstdc++.so.*|libgcc_s.so.*) continue ;;
+              esac
+              found=0
+              for p in "${dirs[@]}"; do
+                if [ -e "$p/$need" ]; then found=1; break; fi
+              done
+              if [ "$found" = "0" ] && { [ -e "/usr/lib/$need" ] || [ -e "/lib/$need" ]; }; then found=1; fi
+              if [ "$found" = "0" ] && /sbin/ldconfig -p 2>/dev/null | grep -q " $need "; then found=1; fi
+              if [ "$found" = "0" ]; then
+                echo "::error::${bin} needs ${need}, which the device's loader will not find"
+                readelf -d "$bin" 2>/dev/null | grep -E 'runpath|rpath' | sed 's/^/    /'
+                fail=1
+              fi
+            done
+          done < <(find "${OUTPUT_DIR}" -type f -perm -u+x)
+          [ "$fail" = "0" ] || exit 1
+          echo "OK: every NEEDED shared lib resolves on-device."
+
+          # --- guard: fail on any LFS pointer stub / oversized file (verbatim from 3X workflow) ---
+          if grep -rlIE "^version https://git-lfs\.github\.com/spec/v1" "${OUTPUT_DIR}" > /tmp/lfs_ptrs.txt; then
+            echo "::error::LFS pointer stubs found in build output (would brick the device):"
+            cat /tmp/lfs_ptrs.txt
+            exit 1
+          fi
+          if find "${OUTPUT_DIR}" -type f -size +99M | grep -q .; then
+            echo "::error::file(s) >99MB in output (GitHub push would reject them):"
+            find "${OUTPUT_DIR}" -type f -size +99M -exec ls -lh {} +
+            exit 1
+          fi
+          echo "OK: no LFS pointer stubs or oversized files in output."
+
+          # --- tar ---
+          tar czf /workspace/prebuilt.tar.gz -C "${OUTPUT_DIR}" .
+          ls -la /workspace/prebuilt.tar.gz
+          APBUILD
+          chmod +x "${RUNNER_TEMP}/ap_build.sh"
+
+      - name: Build in AGNOS container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -e CI=true \
+            -e HOME=/root \
+            -e UV_PROJECT_ENVIRONMENT=/root/venv \
+            -e CACHEDB="${CACHEDB}" \
+            -e XDG_CACHE_HOME="${XDG_CACHE_HOME}" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${RUNNER_TEMP}/opbuild:/data/openpilot" \
+            -v "${RUNNER_TEMP}/cache:/data/cache" \
+            -v "${RUNNER_TEMP}/venv:/root/venv" \
+            -v "${RUNNER_TEMP}/ap_build.sh:/build.sh:ro" \
+            ap-agnos:local bash /build.sh
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt
+          path: prebuilt.tar.gz
+
+  publish:
+    needs: [ build ]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: publish-arm-${{ github.event.inputs.source_branch || github.ref_name }}
+      cancel-in-progress: true
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt
+
+      - name: Untar prebuilt
+        run: |
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          tar xzf prebuilt.tar.gz -C ${{ env.OUTPUT_DIR }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Publish prebuilt (main -> main-pre)
+        env:
+          SRC: ${{ github.event.inputs.source_branch || github.ref_name }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # main -> main-pre (this test); keep the generic mappings for later porting.
+          case "$SRC" in
+            main)    DEV_BRANCH="main-pre" ;;
+            *-src)   DEV_BRANCH="${SRC%-src}" ;;
+            *)       DEV_BRANCH="${SRC}-prebuilt" ;;
+          esac
+          VERSION="$(date '+%Y.%m.%d')-${{ github.run_number }}"
+          GIT_ORIGIN="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          echo "[-] publishing ${SRC} -> ${DEV_BRANCH} on ${REPO}"
+          cd ${{ env.OUTPUT_DIR }}
+          # LFS safety (belt + suspenders): no .gitattributes => `git add` cannot re-pointerize.
+          find . -name .gitattributes -delete
+          # Final pre-commit guard (anchored to the pointer's `version` first line; see 3X workflow).
+          if grep -rlIE "^version https://git-lfs\.github\.com/spec/v1" . > /tmp/lfs_ptrs.txt; then
+            echo "::error::LFS pointer stubs present at publish time:"; cat /tmp/lfs_ptrs.txt; exit 1
+          fi
+          git init -q
+          git remote add origin "$GIT_ORIGIN"
+          git fetch -q origin "$DEV_BRANCH" \
+            || (git checkout -b "$DEV_BRANCH" && git commit -q --allow-empty -m "initial prebuilt" && git push -u origin "$DEV_BRANCH")
+          git add -f .
+          DATETIME=$(date '+%Y-%m-%dT%H:%M:%S')
+          git commit -q -a -m "prebuilt v${VERSION}
+          source branch: ${SRC}
+          date: ${DATETIME}
+          source commit: ${SOURCE_SHA}
+          "
+          git branch -M "$DEV_BRANCH"
+          git push -f origin "$DEV_BRANCH"
