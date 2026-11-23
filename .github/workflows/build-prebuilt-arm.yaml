@@ -3,39 +3,49 @@ name: Build Prebuilt (ARM test)
 # Test of the GitHub-hosted ARM runner option for prebuilt builds (replaces the self-hosted
 # comma 3X tici runner -- see E:\appcb\agnos_container_runner_research.md).
 #
-#   push to main -> build job on ubuntu-24.04-arm (GitHub-hosted, free for public repos, 4 vCPU)
-#                -> publish job (ubuntu-24.04) force-pushes main-pre in this repo
+#   push to ci-arm -> build job on ubuntu-24.04-arm (GitHub-hosted, free for public repos,
+#                     4 vCPU / 16 GB RAM / 14 GB SSD) -> publish job (ubuntu-24.04) force-pushes
+#                     the prebuilt branch in this repo
 #
-# The build runs inside a container imported from the AGNOS system image pinned by THIS branch
-# (openpilot/common/hardware/comma/agnos.json) -- i.e. the exact rootfs the device runs.
-# glibc/Python/venv/clang parity is therefore by construction. No QEMU: the runner itself is
-# arm64, so the container runs natively.
+# ci-arm is the ITERATION branch: this file triggers on pushes to itself, but source_branch
+# defaults to main, so every run still builds main and publishes main-pre. main itself is NOT
+# an iteration target -- it is the road-test branch (the comma 4 tracks it; every push is a
+# device update). Once green end-to-end, the final workflow lands on main as ONE fast-forward
+# commit with the trigger switched back to push: [main].
+#
+# The build runs inside a container imported from the AGNOS system image pinned by the BUILT
+# branch (openpilot/common/hardware/comma/agnos.json) -- i.e. the exact rootfs the device runs.
+# glibc/Python/venv/clang parity is therefore by construction. No QEMU: the runner is arm64,
+# so the container runs natively.
 #
 # Safety carried over from build-prebuilt.yaml (the proven 3X build):
-#   - LFS: release-manifest copy means .gitattributes never enters the tree + hard pointer-stub guard.
+#   - LFS: release-manifest copy means .gitattributes never enters the tree + hard pointer guard.
 #   - RUNPATH: build in /data/openpilot (the device's RUNTIME path) via a bind mount.
 #   - Same scons targets, same ffmpeg vendoring, same NEEDED-lib / LFS / size guards.
 #
 # Differences from the 3X build:
-#   - no powersave toggling (hosted runner, no device CPU governor to restore)
-#   - ephemeral $RUNNER_TEMP mounts instead of /data (no wipe/boot concerns; a fresh runner per job)
-#   - AGNOS image re-derived from the branch manifest each run (cached while the manifest is unchanged)
+#   - no powersave toggling (hosted runner), ephemeral $RUNNER_TEMP mounts, fresh runner per job
+#   - AGNOS image re-derived from the branch manifest each run, cached as the ~962 MB .xz while
+#     the manifest hash is unchanged
+#   - 14 GB disk: .xz deleted after decompression, sparse after conversion, raw after docker
+#     import; workspace source + build tree deleted inside the build; docker rmi after the build.
+#     df -h logged at each phase.
 
 on:
   push:
-    branches: [main]
+    branches: [ci-arm]
   workflow_dispatch:
     inputs:
       source_branch:
-        description: "Branch to build (blank = the branch you run this from)"
+        description: "Branch to build (default: main)"
         required: false
-        default: ""
+        default: "main"
 
 permissions:
   contents: write
 
 env:
-  SOURCE_BRANCH: ${{ github.event.inputs.source_branch || github.ref_name }}
+  SOURCE_BRANCH: ${{ github.event.inputs.source_branch || 'main' }}
   BUILD_DIR: "/data/openpilot"  # MUST equal the device's runtime path (RUNPATH)
   OUTPUT_DIR: ${{ github.workspace }}/output
   SCONS_CACHE_DIR: ${{ github.workspace }}/release/ci/scons_cache
@@ -46,15 +56,28 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     concurrency:
-      group: build-arm-${{ github.event.inputs.source_branch || github.ref_name }}
+      group: build-arm-${{ github.event.inputs.source_branch || 'main' }}
       cancel-in-progress: false
     outputs:
       source_sha: ${{ steps.meta.outputs.sha }}
     steps:
-      - name: Checkout source branch (submodules + LFS)
+      - name: Runner state (disk + emergency-free candidates)
+        run: |
+          df -h /
+          # If a run dies on disk, the documented emergency free (manual, from the UI) is:
+          #   sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet
+          ls -d /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet 2>/dev/null || true
+          docker version --format 'docker {{.Server.Version}}' 2>/dev/null || echo "docker: not preinstalled"
+
+      - name: "Prepare temp dirs (runner-owned: docker bind mounts + cache paths)"
+        run: |
+          mkdir -p "${RUNNER_TEMP}/opbuild" "${RUNNER_TEMP}/cache/tinygrad" "${RUNNER_TEMP}/venv" /tmp/agnos
+
+      - name: Checkout source branch (submodules + LFS, shallow)
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
           ref: ${{ env.SOURCE_BRANCH }}
 
       - name: LFS pull (guarantee real bytes, not pointers)
@@ -62,7 +85,9 @@ jobs:
 
       - name: Record source commit
         id: meta
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          df -h /
 
       - name: Resolve AGNOS system image from branch manifest
         id: agnos
@@ -77,45 +102,76 @@ jobs:
           echo "AGNOS_HASH=$HASH_RAW" >> "$GITHUB_ENV"
           echo "AGNOS system image: $URL"
 
-      - name: Cache AGNOS system image
-        uses: actions/cache@v4
+      - name: Cache AGNOS .xz (restore)
+        uses: actions/cache/restore@v4
         with:
-          path: /tmp/agnos/system.img
-          key: agnos-system-${{ steps.agnos.outputs.hash_raw }}
+          path: /tmp/agnos/system.img.xz
+          key: agnos-xz-${{ steps.agnos.outputs.hash }}
 
-      - name: Download + unpack AGNOS system image
+      - name: Download + decompress AGNOS .xz
+        id: agnosdl
         run: |
           set -e
-          mkdir -p /tmp/agnos
-          if [ ! -f /tmp/agnos/system.img ]; then
+          if [ -f /tmp/agnos/system.img.xz ]; then
+            echo "restored .xz from cache"
+            echo "dl=0" >> "$GITHUB_OUTPUT"
+          else
             curl -fSL --retry 5 --retry-delay 5 -o /tmp/agnos/system.img.xz "${{ steps.agnos.outputs.url }}"
-            xz -d -T0 /tmp/agnos/system.img.xz   # -d removes the .xz on success
+            echo "dl=1" >> "$GITHUB_OUTPUT"
           fi
-          # Hash semantics (openpilot/common/hardware/comma/agnos.py, StreamingDecompressor +
-          # extract_compressed_image): hash = sha256 of the DECOMPRESSED (still-sparse) image,
-          # hash_raw = sha256 of the UNSPARSIFIED raw image. No manifest hash for the .xz itself.
+          xz -dk -T0 /tmp/agnos/system.img.xz   # -k keeps the .xz (cached below)
+          # hash = sha256 of the DECOMPRESSED (still-sparse) image (agnos.py StreamingDecompressor);
+          # hash_raw = sha256 of the UNSPARSIFIED raw image. No manifest hash exists for the .xz.
           echo "${{ steps.agnos.outputs.hash }}  /tmp/agnos/system.img" | sha256sum -c -
-          # sparse ext4 -> raw -> rootfs tree (e2cp reads the image directly, no loop mount needed)
-          command -v unsimg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq e2fsprogs; }
-          unsimg /tmp/agnos/system.img /tmp/agnos/system.raw.img
-          echo "${{ steps.agnos.outputs.hash_raw }}  /tmp/agnos/system.raw.img" | sha256sum -c -
-          mkdir -p /tmp/agnos/rootfs
-          sudo e2cp /tmp/agnos/system.raw.img /tmp/agnos/rootfs/
-          rm /tmp/agnos/system.raw.img
+          df -h /
 
-      - name: Import rootfs as docker image (+ smoke test)
+      - name: Save AGNOS .xz cache (fresh download only)
+        if: steps.agnosdl.outputs.dl == '1'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/agnos/system.img.xz
+          key: agnos-xz-${{ steps.agnos.outputs.hash }}
+
+      - name: Free .xz (14 GB disk)
+        run: rm -f /tmp/agnos/system.img.xz
+      - name: Convert sparse -> raw (simg2img first; hash_raw check is the proof)
         run: |
           set -e
-          if ! command -v docker >/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq docker.io
-            sudo systemctl enable --now docker
+          export DEBIAN_FRONTEND=noninteractive
+          command -v simg2img >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils; }
+          # NOTE: this AGNOS image is the LE sequential sparse variant (agnos.py unsparsify()).
+          # If simg2img misparses the chunk layout, the hash_raw check below catches it and the
+          # Python fallback (an exact mirror of agnos.py) takes over.
+          if simg2img /tmp/agnos/system.img /tmp/agnos/system.raw.img && \
+             echo "${{ steps.agnos.outputs.hash_raw }}  /tmp/agnos/system.raw.img" | sha256sum -c -; then
+            echo "OK: simg2img output matches hash_raw"
+          else
+            echo "::warning::simg2img failed or mismatched -- using Python unsparsify (agnos.py algorithm)"
+            rm -f /tmp/agnos/system.raw.img
+            python3 "${RUNNER_TEMP}/agnos_unsparsify.py"
+            echo "${{ steps.agnos.outputs.hash_raw }}  /tmp/agnos/system.raw.img" | sha256sum -c -
+            echo "OK: Python fallback output matches hash_raw"
           fi
-          tar -C /tmp/agnos/rootfs --numeric-owner -cf /tmp/agnos/rootfs.tar .
-          rm -rf /tmp/agnos/rootfs
-          # runner is arm64, so the imported image is linux/arm64 by default
-          docker import /tmp/agnos/rootfs.tar ap-agnos:local
-          rm /tmp/agnos/rootfs.tar
-          # 30-second smoke test: this container IS the device userspace
+          rm -f /tmp/agnos/system.img   # sparse no longer needed
+          df -h /
+
+      - name: Import rootfs as docker image (loop-mount RO + tar pipe, no intermediate files)
+        run: |
+          set -e
+          command -v docker >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq docker.io; }
+          if ! sudo docker info >/dev/null 2>&1; then sudo systemctl enable --now docker; fi
+          sudo mkdir -p /mnt/agnos
+          sudo mount -o loop,ro /tmp/agnos/system.raw.img /mnt/agnos
+          # sudo on tar matters: the rootfs has root-only files
+          sudo tar -C /mnt/agnos --numeric-owner -cf - . | docker import - ap-agnos:local
+          sudo umount /mnt/agnos
+          rm -f /tmp/agnos/system.raw.img
+          docker images
+          df -h /
+
+      - name: Smoke test AGNOS container (this IS the device userspace)
+        run: |
           docker run --rm --platform linux/arm64 ap-agnos:local bash -lc '
             echo "AGNOS: $(cat /VERSION)"
             test -f /AGNOS && echo "/AGNOS present (SConstruct COMMA_HARDWARE path)"
@@ -123,6 +179,7 @@ jobs:
             clang --version | head -1
             uv --version
             rsync --version | head -1
+            nproc
           '
 
       - name: Cache SCons
@@ -154,11 +211,52 @@ jobs:
           key: venv-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ env.AGNOS_HASH }}-${{ steps.venvkey.outputs.lockhash }}
           restore-keys: |
             venv-${{ runner.arch }}-${{ env.SOURCE_BRANCH }}-${{ env.AGNOS_HASH }}
-
-      - name: Write in-container build script
+      - name: Write helper scripts (Python unsparsify fallback + in-container build)
         run: |
-          # Quoted heredoc: no expansion by the runner shell. Uniform indentation is harmless
-          # (invoked as `bash /build.sh`, so the shebang line is just a comment).
+          # Quoted heredocs: no expansion by the runner shell. Bodies sit at the block-scalar base
+          # indent, so they land at column 0 in the scripts.
+          cat > "${RUNNER_TEMP}/agnos_unsparsify.py" <<'AGNOSP'
+          #!/usr/bin/env python3
+          # AGNOS sparse -> raw. Mirror of openpilot/common/hardware/comma/agnos.py unsparsify() --
+          # the device's own parser. Format (verified on the real image): 28-byte LE file header
+          # (magic 0xed26ff3a, major, minor, fh_sz, ch_sz, blk_sz, total_blks, total_chunks, crc)
+          # + 12-byte chunk headers <H2xI4x> (type, reserved, out_blocks, +4 pad), sequential
+          # layout (no start offset). Types: 0xcac1 raw, 0xcac2 fill, 0xcac3 dontcare.
+          import os
+          import struct
+          SRC, DST = "/tmp/agnos/system.img", "/tmp/agnos/system.raw.img"
+          CHUNK = struct.Struct("<H2xI4x")
+          with open(SRC, "rb") as f, open(DST, "wb") as out:
+              magic, major, minor, fh_sz, ch_sz, blk, total_blks, nchunks, crc = struct.unpack("<IHHHHIIII", f.read(28))
+              assert magic == 0xed26ff3a, f"bad magic {magic:#x}"
+              assert (major, minor) == (1, 0), (major, minor)
+              pos = 0
+              for i in range(nchunks):
+                  ct, ob = CHUNK.unpack(f.read(12))
+                  if ct == 0xcac1:      # raw: payload follows in the file
+                      data = f.read(ob * blk)
+                      assert len(data) == ob * blk, f"chunk {i} truncated"
+                      out.write(data)
+                  elif ct == 0xcac2:    # fill: 4-byte pattern repeated across the block
+                      pat = f.read(4) * (blk // 4)
+                      left = ob
+                      while left:
+                          n = min(left, 1024)
+                          out.write(pat * n)
+                          left -= n
+                  elif ct == 0xcac3:    # dontcare: yields nothing
+                      pass
+                  else:
+                      raise SystemExit(f"chunk {i}: unhandled sparse chunk type {ct:#06x}")
+                  pos += ob * blk
+                  if i % 1000 == 0:
+                      print(f"  chunk {i}/{nchunks} pos={pos} bytes", flush=True)
+              if pos < total_blks * blk:
+                  tail = total_blks * blk - pos
+                  print(f"  dontcare shortfall {tail} bytes -> zero pad", flush=True)
+                  out.write(b"\x00" * tail)
+          print(f"done: {os.path.getsize(DST)} bytes", flush=True)
+          AGNOSP
           cat > "${RUNNER_TEMP}/ap_build.sh" <<'APBUILD'
           #!/bin/bash
           set -euo pipefail
@@ -168,6 +266,7 @@ jobs:
           unset VIRTUAL_ENV
           mkdir -p /data/cache/tinygrad
           cd /workspace
+          echo "=== disk at container start ==="; df -h /data /workspace 2>/dev/null || df -h
           # --extra tools: SConstruct imports bzip2/ncurses unconditionally (see 3X workflow comment)
           uv sync --frozen --extra tools --python /usr/local/venv/bin/python
           export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT}"
@@ -181,6 +280,16 @@ jobs:
           export PYTHONPATH="${BUILD_DIR}"
           # Copy only release-manifest files (this is why .gitattributes never enters the tree).
           ./tools/release/release_files.py | tr '\n' '\0' | rsync -rRl --from0 --files-from=- . "${BUILD_DIR}/"
+
+          # Free the workspace source now: nothing after this reads it (verified: SConstruct and
+          # every SConscript never invoke git; the ffmpeg libs come from the venv, not the tree).
+          # Keep release/ (the scons cache_dir), output/ and prebuilt.tar.gz (build output) --
+          # the runner disk is 14 GB.
+          find /workspace -mindepth 1 -maxdepth 1 \
+            ! -name release ! -name output ! -name prebuilt.tar.gz \
+            -exec rm -rf {} +
+          echo "=== disk after workspace source delete ==="; df -h /data /workspace 2>/dev/null || df -h
+
           cd "${BUILD_DIR}"
           sed -i '/from .board.jungle import PandaJungle, PandaJungleDFU/s/^/#/' panda/__init__.py
 
@@ -192,7 +301,6 @@ jobs:
           scons -j"$(nproc)" cache_dir=/workspace/release/ci/scons_cache --minimal openpilot/selfdrive/locationd
           echo "Building rest of sunnypilot..."
           scons -j"$(nproc)" cache_dir=/workspace/release/ci/scons_cache --minimal
-
           # comma-deps-ffmpeg is a SHARED build: libav* RPATH points into THIS venv, a path no
           # tester's device has. Ship the three libs next to the binaries ($ORIGIN is on their RPATH).
           FFMPEG_LIB=$(python3 -c 'import ffmpeg; print(ffmpeg.LIB_DIR)')
@@ -230,6 +338,10 @@ jobs:
             --delete-excluded \
             --chown=comma:comma \
             "${BUILD_DIR}/" "${OUTPUT_DIR}/"
+
+          # Free the build tree (outputs already staged into OUTPUT_DIR) before the tar -- 14 GB disk.
+          find "${BUILD_DIR}" -mindepth 1 -delete
+          echo "=== disk after build-tree delete ==="; df -h /data /workspace 2>/dev/null || df -h
 
           # --- guard: every shared lib the binaries need must be resolvable (verbatim from 3X workflow) ---
           fail=0
@@ -283,6 +395,7 @@ jobs:
 
       - name: Build in AGNOS container
         run: |
+          df -h /
           docker run --rm --platform linux/arm64 \
             -e CI=true \
             -e HOME=/root \
@@ -296,17 +409,22 @@ jobs:
             -v "${RUNNER_TEMP}/ap_build.sh:/build.sh:ro" \
             ap-agnos:local bash /build.sh
 
+      - name: Release docker image + build dir (14 GB disk)
+        run: |
+          sudo docker rmi -f ap-agnos:local || true
+          sudo find "${RUNNER_TEMP}/opbuild" -mindepth 1 -delete 2>/dev/null || true
+          df -h /
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: prebuilt
           path: prebuilt.tar.gz
-
   publish:
     needs: [ build ]
     runs-on: ubuntu-24.04
     concurrency:
-      group: publish-arm-${{ github.event.inputs.source_branch || github.ref_name }}
+      group: publish-arm-${{ github.event.inputs.source_branch || 'main' }}
       cancel-in-progress: true
     steps:
       - name: Download build artifact
@@ -326,7 +444,7 @@ jobs:
 
       - name: Publish prebuilt (main -> main-pre)
         env:
-          SRC: ${{ github.event.inputs.source_branch || github.ref_name }}
+          SRC: ${{ github.event.inputs.source_branch || 'main' }}
           REPO: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
