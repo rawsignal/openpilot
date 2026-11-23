@@ -36,7 +36,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
+from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan, get_lat_smooth_seconds
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
@@ -52,14 +52,6 @@ LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
-
-# Speed-scheduled lateral curvature smoothing time: `max_seconds` at crawl, fading to 0 by LAT_SMOOTH_BP[1].
-# Driven per-car by CarParams.lateralSmoothSeconds (0 => off, so other cars are unchanged). The caller
-# delay-compensates (lat_delay += the returned value), so the smoothing adds no net steering lag.
-LAT_SMOOTH_BP = [2.0, 8.0]  # m/s
-
-def get_lat_smooth_seconds(v_ego: float, max_seconds: float) -> float:
-  return float(np.interp(v_ego, LAT_SMOOTH_BP, [max_seconds, 0.0]))
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,

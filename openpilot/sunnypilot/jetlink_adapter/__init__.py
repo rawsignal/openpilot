@@ -123,10 +123,12 @@ def _adapter_class():
       # the first frame above MIN_LAT_CONTROL_SPEED. The large model keeps
       # stock's action path, smoothing included; blendful is the local
       # bundle's
+      # modeld_v2 also passes lat_smooth_seconds (the car's crawl smoothing); it goes through as stock's sixth argument.
       from openpilot.selfdrive.modeld.modeld import get_action_from_model
 
-      def action(model_output, prev_action, lat_action_t, long_action_t, v_ego, blendful=None):
-        return get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
+      def action(model_output, prev_action, lat_action_t, long_action_t, v_ego, blendful=None, lat_smooth_seconds=0.0):
+        return get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego,
+                                     0.0 if lat_smooth_seconds is None else lat_smooth_seconds)
       return action
 
     # The large model is comma's, so the stock parser, constants and action path

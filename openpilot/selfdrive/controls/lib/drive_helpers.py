@@ -66,3 +66,11 @@ def get_curvature_from_plan(yaws, yaw_rates, t_idxs, vego, action_t):
     psi_target = np.interp(action_t, t_idxs, yaws)
   psi_rate = yaw_rates[0]
   return curv_from_psis(psi_target, psi_rate, vego, action_t)
+
+# Speed-scheduled lateral curvature smoothing time: `max_seconds` at crawl, fading to 0 by LAT_SMOOTH_BP[1].
+# Driven per-car by CarParams.lateralSmoothSeconds (0 => off, so other cars are unchanged). The caller
+# delay-compensates (lat_delay += the returned value), so the smoothing adds no net steering lag.
+LAT_SMOOTH_BP = [2.0, 8.0]  # m/s
+
+def get_lat_smooth_seconds(v_ego: float, max_seconds: float) -> float:
+  return float(np.interp(v_ego, LAT_SMOOTH_BP, [max_seconds, 0.0]))

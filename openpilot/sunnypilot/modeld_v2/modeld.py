@@ -35,7 +35,7 @@ from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
+from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_lat_smooth_seconds
 from openpilot.selfdrive.modeld.modeld import ChestnutGpuState
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
@@ -232,7 +232,8 @@ class ModelState(ModelStateBase):
 
   def get_action_from_model(self, model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                             lat_action_t: float, long_action_t: float, v_ego: float,
-                            blendful: Callable[[float], float] | None = None) -> log.ModelDataV2.Action:
+                            blendful: Callable[[float], float] | None = None,
+                            lat_smooth_seconds: float | None = None) -> log.ModelDataV2.Action:
     if 'action' not in model_output:
       plan = model_output['plan'][0]
       desired_accel = get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0], self.constants.T_IDXS,
@@ -252,7 +253,8 @@ class ModelState(ModelStateBase):
 
     if self.generation is not None and self.generation >= 10: # smooth curvature for post FOF models
       if v_ego > self.MIN_LAT_CONTROL_SPEED:
-        desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, self.LAT_SMOOTH_SECONDS)
+        lat_smooth = self.LAT_SMOOTH_SECONDS if lat_smooth_seconds is None else lat_smooth_seconds
+        desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, lat_smooth)
       else:
         desired_curvature = prev_action.desiredCurvature
 
@@ -433,7 +435,13 @@ def main(demo=False):
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
       blendful_enabled = params.get_bool("Blendful")
-    lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
+    # the car's speed-scheduled crawl smoothing (CP.lateralSmoothSeconds), as stock modeld and controlsd use;
+    # the model's own `lat` override still applies when it is larger. Only post-FOF models smooth (generation >= 10).
+    lat_smooth_seconds = model.LAT_SMOOTH_SECONDS
+    generation = getattr(model, 'generation', None)
+    if generation is not None and generation >= 10:
+      lat_smooth_seconds = max(lat_smooth_seconds, get_lat_smooth_seconds(v_ego, CP.lateralSmoothSeconds))
+    lat_delay = model.lat_delay + lat_smooth_seconds
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -511,7 +519,8 @@ def main(demo=False):
         prev_action.desiredCurvature = sm['controlsState'].curvature
       blendful_active = desire == log.Desire.none and DH.lane_change_state == log.LaneChangeState.off
       action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego,
-                                           partial(blendful.update, model_output, v_ego, blendful_active, enabled=blendful_enabled))
+                                           partial(blendful.update, model_output, v_ego, blendful_active, enabled=blendful_enabled),
+                                           lat_smooth_seconds=lat_smooth_seconds)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
