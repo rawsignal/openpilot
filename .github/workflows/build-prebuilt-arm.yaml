@@ -451,6 +451,19 @@ jobs:
           APBUILD
           cat > "${RUNNER_TEMP}/headless_modelpkls.py" <<'PKLSCRIPT'
           #!/usr/bin/env python3
+          # FORMAT-2 (headless hcq_compile) production pipeline — this is the content that becomes
+          # headless_modelpkls.py on the ci-arm branch (wire_workflow.py re-embeds it). Converted
+          # from the format-1 baseline on 2026-11-24, mirroring the validated single-pkl retarget
+          # (pkl_retarget_hcq.py): retarget step 6 = compile_linear (NOT lower_and_compile), the
+          # format-1 PM_TARGET rewrite is gone (only host CPU programs remain after hcq_compile),
+          # the plain warp dump KEEPs Buffer storage, and verify() checks the format-2 invariants
+          # (host-only CPU programs with BINARY, top-level calls HCQInfo/STORE-copy only, headless
+          # hcq_link). Local x86-only helpers (the docker-compileserver retry wrapper,
+          # CPLLV_CROSS_ARCH) are deliberately NOT here: on the aarch64 CI the QCOM codegen is
+          # in-process and the host compile is native. Validation status: 6/6 GREEN on x86 with the
+          # exact CI capture recipe (OOB blobs byte-identical to the published CI asset); the 3X
+          # loads and executes the x86-built pkls end-to-end. Numeric/perf validation is done
+          # against the CI-published pkls only — see E:\appcb\arm_runner_status.md (2026-11-24).
           """Headless build of the 6 GPU model pkls (the DEV=QCOM scons targets that need /dev/kgsl-3d0).
           
           Usage: headless_modelpkls.py <key> <build_dir> <out_dir>
@@ -459,21 +472,39 @@ jobs:
             1. capture each artifact under DEV=CPU:LLVM with the SConscript-identical commands
                (+ --retargetable so no CPU binaries are embedded in the pkls)
             2. retarget each capture to headless-precompiled QCOM:
-               - strip the CPU-rendered SOURCE/BINARY from every PROGRAM
                - undo the CPU-conditional FDIV rewrite (the QCOM renderer has no FDIV codegen)
+               - strip the CPU-rendered SOURCE/BINARY from every PROGRAM (fresh render below)
                - rewrite device strings CPU -> QCOM (leaf args + specs + expected_input_info; NPY kept)
-               - re-render + compile under the 3X-equivalent context
+               - compile_linear under the 3X-equivalent context
                  (QCOM:CL:a630,IMAGE_PITCH_ALIGNMENT=64, IMAGE=1, FLOAT16=1, OPENPILOT_HACKS=1;
-                 codegen is in-process libllvm-qcom on aarch64, no GPU)
-               - rewrite every PROGRAM target to the QCOM target
+                 codegen is in-process libllvm-qcom on aarch64, no GPU). compile_linear =
+                 lower_and_compile (per-kernel QCOM BINARYs) + hcq_compile (encode into KGSL
+                 command queues + compile the host submit/fence programs). hcq_compile is
+                 MANDATORY: the on-device exec path (pm_exec) only runs calls whose aux is
+                 HCQInfo (exec_hcq -> host CPU:LLVM submit -> kgsl ioctl); QCOM has no runtime_t,
+                 so a per-kernel (pre-hcq) graph crashes on the first model call. After hcq_compile
+                 the only PROGRAMs left are the host submit/fence programs (CPU-targeted); the QCOM
+                 kernels live encoded in the KGSL stream.
+               - host-program portability: the submit/fence programs run on the 3X's Cortex-A78 but
+                 are compiled here, so pin CPU:LLVM codegen "native" -> "generic" (LLVM's portable
+                 baseline for both arm64 and x86_64) or the build machine's CPU features (e.g. SVE
+                 on a Graviton) SIGILL the device.
                - dump (OOB model pkls: the weight blob must come out byte-identical;
-                 warp pkls: plain pickle with storage dropped so buffers allocate on the GPU at first use)
-            3. verify (reload, spec devices, every PROGRAM has a QCOM-target BINARY, blob identity)
+                 warp pkls: plain pickle with the Buffer device strings rewritten to QCOM and the
+                 storage KEPT -- Buffer.__reduce_ex__ ships the bytes as initial_value, which the 3X
+                 re-allocates + uploads on load; the reference device warp pkls all ship storage)
+            3. verify (reload, spec devices, buffer-carrying leaf args QCOM/NPY, programs
+               host-only, top-level calls all HCQInfo batches or STORE copies, the device-side
+               hcq_link path runs headless, blob identity)
             4. write manifest.json (key + sha256 + bytes per pkl) and the 6 pkls to <out_dir>
           
-          The retarget machinery was developed and validated as wf_validate/retarget_proto.py
-          (all 6 artifacts green: OOB weight blobs byte-identical to the CPU captures, buffer
-          shapes identical to the comma-4 reference pkls).
+          Validated (2026-11-24): 6/6 retargets GREEN on x86 (docker compileserver, exact CI
+          capture recipe) with OOB weight blobs byte-identical to the published CI asset, and
+          the 3X loads and executes the resulting pkls end-to-end (host submit program runs,
+          specs match the comma-4 reference). Kernel numerics/performance are arbitrated ONLY
+          by the CI-published pkls on the 3X: x86 docker-compiled QCOM kernels are a different
+          compiler output (zero kernel-image hash overlap vs the reference; 100-2000x slower
+          on the a630, GPU-clock-proven) and cannot meet the 1e-3-rel bar by construction.
           """
           import hashlib
           import json
@@ -484,6 +515,7 @@ jobs:
           import subprocess
           import sys
           import tempfile
+          from collections import Counter
           from dataclasses import replace as dreplace
           from pathlib import Path
           
@@ -505,7 +537,7 @@ jobs:
           
           from tinygrad import Context, dtypes
           from tinygrad.device import Buffer, Compiled, Device
-          from tinygrad.engine.realize import lower_and_compile
+          from tinygrad.engine.realize import compile_linear
           from tinygrad.uop.ops import Ops, PatternMatcher, UPat, graph_rewrite
           
           from examples.openpilot.helpers import dump_pickle, load_pickle
@@ -527,17 +559,33 @@ jobs:
           # The real QCOMDevice.__init__ opens /dev/kgsl-3d0 (the GPU), which the container does
           # not have. Compilation only needs the renderers + arch, so rebind __init__ to a
           # headless version that reuses the CPU allocator for alignment queries. Every
-          # Device["QCOM*"] instantiation goes through this (which is also why the
-          # Device["QCOM"].arch check in step 7 below holds).
+          # Device["QCOM*"] instantiation goes through this (the encode path's gpu_id branch is
+          # pinned to the 3X's a630 below).
           import tinygrad.runtime.ops_qcom as _oq
           from tinygrad.renderer.cstyle import QCOMCLRenderer
           from tinygrad.renderer.nir import IR3Renderer
           
           def _headless_qcom_init(self, device=""):
             Compiled.__init__(self, "QCOM", Device["CPU"].allocator, [QCOMCLRenderer, IR3Renderer], None, arch=ARCH)
+            # the real __init__ derives gpu_id from the kgsl device-info ioctl; the encode path
+            # branches on it (signal(): a6xx vs a7xx+). ARCH "a630" = ("a%d%d%d") % (6,3,0).
+            self.gpu_id = (6, 3, 0)
           
           _oq.QCOMDevice.__init__ = _headless_qcom_init
           _oq.QCOMDevice.finalize = lambda self: None
+          
+          # Host-program portability: the batch submit/fence programs run on the DEVICE's CPU
+          # (3X: Cortex-A78), but they are compiled here on the build machine. The CPU:LLVM
+          # device's arch ends in ",native" (ops_cpu.py) and CPULLVMCompiler maps "native" to
+          # LLVMGetHostCPUName() + host features -- i.e. code for the BUILD machine's CPU. A
+          # Graviton/Neoverse host may emit instructions an A78 cannot decode (e.g. SVE),
+          # SIGILLing the 3X at the first model call. Pin the host codegen to LLVM's portable
+          # baseline: "generic" is the baseline CPU for both arm64 (ARMv8-A) and x86_64.
+          from tinygrad.runtime.support import compiler_llvm as _cllvm
+          _orig_cpllv_init = _cllvm.CPULLVMCompiler.__init__
+          def _portable_cpllv_init(self, arch, cache_key=None):
+            _orig_cpllv_init(self, [a if a != "native" else "generic" for a in arch], cache_key)
+          _cllvm.CPULLVMCompiler.__init__ = _portable_cpllv_init
           
           # The OOB load (helpers.load_pickle, persistent_load = buffers.view(nbytes, off))
           # recreates every sidecar buffer as a VIEW of one big buffer. Views are "unallocated"
@@ -679,16 +727,6 @@ jobs:
           
           PM_LINEAR_FIX = PatternMatcher([(UPat(Ops.PROGRAM, name="p"), fix_kernel_linear)])
           
-          # The ctx parameter carries the QCOM target (closures are not supported in pm
-          # callbacks, so the target can't be captured -- pass it via graph_rewrite(ctx=...)).
-          def set_program_target(p, ctx):
-            arg = p.arg
-            if arg is None or getattr(arg, "target", None) is None: return p
-            if arg.target.device != "QCOM": return p.replace(arg=dreplace(arg, target=ctx))
-            return p
-          
-          PM_TARGET = PatternMatcher([(UPat(Ops.PROGRAM, name="p"), set_program_target)])
-          
           def oob_tail(path):
             with open(path, "rb") as f:
               opcodes_len = struct.unpack("<q", f.read(8))[0]
@@ -778,31 +816,31 @@ jobs:
             ]
             print("[retarget] expected_input_info devices:", [e[3] for e in _cj.expected_input_info], flush=True)
           
-            # 6. headless QCOM precompile (3X-equivalent context)
+            # 6. headless QCOM precompile + hcq encoding (3X-equivalent context).
+            # compile_linear = lower_and_compile (per-kernel QCOM BINARYs) + hcq_compile (encode
+            # the kernels into KGSL command queues + compile the host submit/fence programs).
+            # hcq_compile is MANDATORY: the on-device exec path (pm_exec) only runs calls whose
+            # aux is HCQInfo; QCOM has no runtime_t, so a per-kernel (pre-hcq) graph crashes on
+            # the first model call (AssertionError in Compiled.runtime).
             with Context(**COMPILE_CTX):
-              a["run"].captured._linear = lower_and_compile(a["run"].captured._linear, verbose=False)
-            print("[retarget] QCOM compile done", flush=True)
+              a["run"].captured._linear = compile_linear(a["run"].captured._linear, input_uops=None, profile=False, cache=False)
+            print("[retarget] QCOM compile + hcq encode done", flush=True)
           
-            # 7. ProgramInfo.target -> the QCOM target the compile used
-            qdev = Device["QCOM"]
-            assert qdev.renderers and qdev.arch == ARCH
-            qcom_target = next(iter(qdev.cached_renderer.values())).target
-            assert qcom_target.device == "QCOM" and qcom_target.arch == ARCH, qcom_target
-            a["run"].captured._linear = graph_rewrite(a["run"].captured._linear, PM_TARGET, ctx=qcom_target, walk=True, enter_calls=True)
+            # (format-1 step 7, the ProgramInfo.target -> QCOM rewrite, is gone: after
+            # hcq_compile the only PROGRAMs left are the host CPU submit/fence programs, which
+            # keep their own target; the QCOM kernels live encoded in the KGSL stream.)
           
-            # 8. dump
+            # 7. dump
             if oob:
               with Context(DEV="CPU:LLVM"):
                 dump_pickle(a, str(dst))
             else:
-              # plain pickle (warp pkls): Buffer objects pickle their __dict__, so rewrite the
-              # device strings and drop storage (buffers re-allocate on the GPU at first use; the
-              # reference pkls embed capture-time bytes that are overwritten on the first frame
-              # anyway, so the storage-free form is behaviorally equivalent)
+              # plain pickle (warp pkls): rewrite the Buffer device strings and KEEP the storage --
+              # Buffer.__reduce_ex__ ships the bytes as initial_value, which the 3X re-allocates
+              # on QCOM and uploads at load; the reference device warp pkls all ship storage.
               for b in collect_buffers(a):
                 if b.device == "CPU":
                   b.device = "QCOM"
-                  b._storage = None
               with open(dst, "wb") as f: pickle.dump(a, f)
             print(f"[retarget] wrote {dst}", flush=True)
           
@@ -818,12 +856,27 @@ jobs:
             lin2 = b["run"].captured._linear
             devs2 = walk_devices(lin2)
             print("[verify] reloaded devices:", devs2, flush=True)
-            assert "CPU" not in devs2, "CPU device strings survived"
-            # the underlying Buffer objects (ParamArg.buffer) must also be device-safe: on-device
-            # they are what exec_kernel ensure_allocates, so a leftover CPU buffer = host alloc in
-            # a GPU graph. Plain pkls must not ship storage either (Buffers pickle their __dict__).
-            # OOB pkls: the buffers are views of the single file-backed base; their device string is
-            # the load-time DEFAULT (QCOM on-device) by construction, so check the view structure.
+            # device strings: every leaf arg that carries a REAL Buffer object must be QCOM/NPY
+            # (on-device those are what get ensure_allocated in the GPU graph). "CPU" strings on
+            # the format-2 runtime PARAM slots are EXPECTED: hcq_compile tags its exec-time slots
+            # with HCQ_RUNTIME_DEV ("CPU"), and pm_exec resolves them to the real input buffers per
+            # run -- the reference 3X device pkls have exactly those. So do NOT assert "CPU" is
+            # absent from walk_devices (that was a format-1 invariant).
+            badleaf = []
+            seen, stack = set(), [lin2]
+            while stack:
+              u = stack.pop()
+              if id(u) in seen: continue
+              seen.add(id(u))
+              if isinstance(getattr(u.arg, "buffer", None), Buffer) and u.arg.device not in ("QCOM", "NPY"):
+                badleaf.append((u.op.name, u.arg.device))
+              stack.extend(u.src)
+            assert not badleaf, f"buffer-carrying leaf args off-device: {badleaf[:5]}"
+            # the underlying Buffer objects (ParamArg.buffer) must also be device-safe:
+            # OOB pkls: the buffers are views of the single blob base (allocated at load);
+            # plain pkls: every non-NPY buffer must be QCOM AND ALLOCATED -- the pickle's
+            # initial_value payload only reaches the GPU if the buffer serializes allocated (the
+            # reference device warp pkls all ship storage; the 3X re-allocates + uploads at load).
             bufs2 = collect_buffers(b)
             print(f"[verify] buffers={len(bufs2)}", flush=True)
             if oob:
@@ -838,23 +891,49 @@ jobs:
               assert not badv, [repr(x) for x in badv[:5]]
             else:
               badbuf = [x for x in bufs2 if x.device not in ("QCOM", "NPY")]
-              stored = [x for x in bufs2 if x._storage is not None and x.device != "NPY"]
-              print(f"[verify] bad_device={len(badbuf)} shipped_storage={len(stored)}", flush=True)
+              unalloc = [x for x in bufs2 if x.device != "NPY" and not x.is_allocated()]
+              print(f"[verify] bad_device={len(badbuf)} unallocated={len(unalloc)}", flush=True)
               assert not badbuf, [repr(x) for x in badbuf[:5]]
-              assert not stored, [repr(x) for x in stored[:5]]
+              assert not unalloc, [repr(x) for x in unalloc[:5]]
             # 5b round-trip: the device-side JitError check must see only QCOM/NPY
             badii = [e[3] for e in b["run"].captured.expected_input_info if e[3] not in ("QCOM", "NPY")]
             assert not badii, badii
+            # programs: after hcq_compile the ONLY PROGRAMs left are the host submit/fence
+            # programs (CPU target, BINARY present) -- exec_hcq runs them via the host CPU:LLVM
+            # runtime, which does the kgsl ioctl. The QCOM kernels are NOT PROGRAMs: they are
+            # encoded into the KGSL command stream (inline BINARY uops).
             progs = collect_programs(lin2)
             nbinary = sum(1 for p in progs if p.src and p.src[-1].op is Ops.BINARY)
-            badtarget = [p for p in progs if p.arg.target.device != "QCOM"]
-            print(f"[verify] programs={len(progs)} with_binary={nbinary} bad_target={len(badtarget)}", flush=True)
-            assert nbinary == len(progs) and len(progs) > 0 and not badtarget, "missing QCOM binaries/targets"
+            badhost = [str(p.arg.target) for p in progs if not p.arg.target.device.startswith("CPU")]
+            print(f"[verify] programs={len(progs)} with_binary={nbinary} bad_host={len(badhost)}", flush=True)
+            assert len(progs) > 0 and nbinary == len(progs) and not badhost, "host programs must be CPU-targeted with BINARY"
+            # top-level calls: the only shapes the on-device exec path (pm_exec) can run are
+            # HCQInfo batches (exec_hcq -> host submit program -> kgsl ioctl) and STORE copies
+            # (exec_copy). A per-kernel PROGRAM call without HCQInfo would hit exec_kernel ->
+            # get_runtime("QCOM") -> unwrap(runtime_t=None) -> AssertionError on the first call.
+            from tinygrad.runtime.support.hcq2 import HCQInfo
+            tl = lin2.src
+            def tl_kind(c):
+              wc = c.without_after
+              if wc.op is not Ops.CALL: return "other"
+              if isinstance(getattr(getattr(wc, "arg", None), "aux", None), HCQInfo): return "hcq"
+              return "copy" if wc.src and wc.src[0].op is Ops.STORE else "other"
+            kinds = Counter(tl_kind(c) for c in tl)
+            print(f"[verify] top-level calls: {len(tl)}, kinds={dict(kinds)}", flush=True)
+            assert len(tl) > 0 and set(kinds) <= {"hcq", "copy"} and kinds["hcq"] > 0, "top-level calls not exec-able on device"
             if oob:
               _, blob_after = oob_tail(dst)
               h1, h2 = hashlib.sha256(blob_before).hexdigest()[:16], hashlib.sha256(blob_after).hexdigest()[:16]
               print(f"[verify] oob blob: before={len(blob_before)}B {h1}  after={len(blob_after)}B {h2}", flush=True)
               assert h1 == h2, "OOB weight blob changed!"
+            # the device-side link path, run headless: `captured.linear` is exactly what the 3X
+            # does on every modeld call (run_linear -> link_linear(allow_cache=False) -> hcq_link:
+            # bufferize the batch ALLOCs, bake the GETADDRs, write the BINARY stream bytes). No
+            # execution is needed (no /dev/kgsl-3d0 here); a link failure here would be a load
+            # failure there.
+            with Context(**COMPILE_CTX):
+              linked = b["run"].captured.linear
+              print(f"[verify] headless hcq_link OK: {len(linked.src)} top calls", flush=True)
             print("[verify] ALL CHECKS PASSED", flush=True)
           
           # --- capture driver + main -----------------------------------------------------------
