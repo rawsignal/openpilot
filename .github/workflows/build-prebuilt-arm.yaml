@@ -974,9 +974,12 @@ jobs:
           set -e
           ASSET="modelpkls_${{ steps.pklkey.outputs.key }}.tar.gz"
           mkdir -p "${RUNNER_TEMP}/pkls"
-          if gh release view pkl-cache --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
+          # explicit --repo: the build script deletes the workspace .git, so gh cannot
+          # infer the repository from cwd by the time later steps run (this step is before
+          # the build, but keep it uniform and cwd-independent)
+          if gh release view --repo "${{ github.repository }}" pkl-cache --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
             echo "cache HIT: $ASSET"
-            gh release download pkl-cache --pattern "$ASSET" --dir "${RUNNER_TEMP}/pkls"
+            gh release download --repo "${{ github.repository }}" pkl-cache --pattern "$ASSET" --dir "${RUNNER_TEMP}/pkls"
             tar xzf "${RUNNER_TEMP}/pkls/$ASSET" -C "${RUNNER_TEMP}/pkls"
             rm -f "${RUNNER_TEMP}/pkls/$ASSET"
             ls -la "${RUNNER_TEMP}/pkls"
@@ -1006,7 +1009,10 @@ jobs:
             ap-agnos:local bash /build.sh
 
       - name: Publish model pkls to release-asset cache (miss only)
-        if: steps.pklfetch.outputs.hit == '0'
+        # success(): a custom if: alone overrides the implicit success gate, and this
+        # step runs AFTER the build deleted the workspace .git -- on a failed build it
+        # would publish a garbage asset that a later run would cache-hit.
+        if: success() && steps.pklfetch.outputs.hit == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1016,10 +1022,12 @@ jobs:
           # (manifest.json + the 6 pkls) is the cache unit.
           tar czf "$ASSET" -C "${RUNNER_TEMP}/pkls" .
           ls -lh "$ASSET"
-          gh release view pkl-cache >/dev/null 2>&1 || \
-            gh release create pkl-cache --title "Model pkl cache" \
+          # explicit --repo: ap_build.sh deleted the workspace .git (14 GB disk guard),
+          # so gh cannot infer the repository from cwd here.
+          gh release view --repo "${{ github.repository }}" pkl-cache >/dev/null 2>&1 || \
+            gh release create --repo "${{ github.repository }}" pkl-cache --title "Model pkl cache" \
               --notes "Headless-built GPU model pkls for the ARM CI. One asset per model-input key; each tar.gz holds manifest.json (key + sha256 + bytes) + the 6 pkls."
-          gh release upload pkl-cache "$ASSET" --clobber
+          gh release upload --repo "${{ github.repository }}" pkl-cache "$ASSET" --clobber
           echo "published $ASSET"
 
       - name: Release docker image + build dir (14 GB disk)
