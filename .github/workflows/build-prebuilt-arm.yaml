@@ -30,6 +30,13 @@ name: Build Prebuilt (ARM test)
 #   - 14 GB disk: .xz deleted after decompression, sparse after conversion, raw after docker
 #     import; workspace source + build tree deleted inside the build; docker rmi after the build.
 #     df -h logged at each phase.
+#   - the 6 GPU model pkls (DEV=QCOM scons targets that open /dev/kgsl-3d0 at build time --
+#     impossible in the GPU-less container) are built HEADLESS inside the container instead:
+#     CPU:LLVM capture (SConscript-mirrored commands + --retargetable) + in-process QCOM
+#     precompile (libllvm-qcom, no GPU). The results are cached as a release asset on THIS
+#     repo (release "pkl-cache", asset modelpkls_<key>.tar.gz), keyed by the model inputs
+#     (tinygrad gitlink+tree, modeld SConscript, ONNX, transformations, nv12_info, tg_flags,
+#     pipeline scripts). Miss -> pipeline runs in the build container -> asset published.
 
 on:
   push:
@@ -284,6 +291,40 @@ jobs:
           # Copy only release-manifest files (this is why .gitattributes never enters the tree).
           ./tools/release/release_files.py | tr '\n' '\0' | rsync -rRl --from0 --files-from=- . "${BUILD_DIR}/"
 
+          # --- model pkls (release-asset cache; /pkls is a runner bind mount) ---
+          # The 6 DEV=QCOM scons targets need /dev/kgsl-3d0 at build time. Gate them off
+          # (the driving-warp loop, like the already-gated dm-warp loop) and stage the
+          # headless-built pkls instead. BUILD_DIR copy only: the pkl cache key was
+          # computed from the pristine checkout.
+          sed -i "s/^for cam_w, cam_h in camera_configs:\$/for cam_w, cam_h in [] if os.getenv('SKIP_TINYGRAD_COMPILE') else camera_configs:/" \
+            "${BUILD_DIR}/openpilot/selfdrive/modeld/SConscript"
+          n=$(grep -c SKIP_TINYGRAD_COMPILE "${BUILD_DIR}/openpilot/selfdrive/modeld/SConscript" || true)
+          [ "$n" = "3" ] || { echo "::error::modeld SConscript SKIP gate patch failed (count=$n, want 3)"; exit 1; }
+          export SKIP_TINYGRAD_COMPILE=1
+          if [ ! -f /pkls/manifest.json ]; then
+            echo "::group::model pkl cache miss -> headless pipeline (key=${PKL_KEY})"
+            python3 /headless_modelpkls.py "${PKL_KEY}" "${BUILD_DIR}" /pkls
+            echo "::endgroup::"
+          fi
+          # Verify the manifest (key + sha256 + bytes) and stage into the build tree before scons.
+          python3 - <<'PKLCHK'
+          import hashlib, json, os, shutil
+          m = json.load(open("/pkls/manifest.json"))
+          key = os.environ["PKL_KEY"]
+          assert m["key"] == key, f"manifest key {m['key']} != {key}"
+          models = "/data/openpilot/openpilot/selfdrive/modeld/models"
+          assert len(m["pkls"]) == 6, f"manifest lists {len(m['pkls'])} pkls, want 6"
+          for name, info in sorted(m["pkls"].items()):
+            data = open(os.path.join("/pkls", name), "rb").read()
+            assert len(data) == info["bytes"], (name, len(data), info["bytes"])
+            assert hashlib.sha256(data).hexdigest() == info["sha256"], name
+            dst = os.path.join(models, name)
+            shutil.copyfile(os.path.join("/pkls", name), dst)
+            assert hashlib.sha256(open(dst, "rb").read()).hexdigest() == info["sha256"], ("staged copy", name)
+            print(f"OK {name} {len(data)}B {info['sha256'][:16]}", flush=True)
+          print("OK: 6 model pkls verified + staged into the build tree", flush=True)
+          PKLCHK
+
           # Free the workspace source now: nothing after this reads it (verified: SConstruct and
           # every SConscript never invoke git; the ffmpeg libs come from the venv, not the tree).
           # Keep release/ (the scons cache_dir), output/ and prebuilt.tar.gz (build output) --
@@ -390,11 +431,560 @@ jobs:
           fi
           echo "OK: no LFS pointer stubs or oversized files in output."
 
+          # --- guard: the 6 model pkls in the output tree must still match the manifest ---
+          python3 - <<'PKLCHK2'
+          import hashlib, json, os
+          m = json.load(open("/pkls/manifest.json"))
+          models = "/workspace/output/openpilot/selfdrive/modeld/models"
+          assert len(m["pkls"]) == 6, f"manifest lists {len(m['pkls'])} pkls, want 6"
+          for name, info in sorted(m["pkls"].items()):
+            data = open(os.path.join(models, name), "rb").read()
+            assert len(data) == info["bytes"], (name, len(data), info["bytes"])
+            assert hashlib.sha256(data).hexdigest() == info["sha256"], name
+            print(f"OK output {name} {len(data)}B {info['sha256'][:16]}", flush=True)
+          print("OK: 6 model pkls in the output tree match the manifest.", flush=True)
+          PKLCHK2
+
           # --- tar ---
           tar czf /workspace/prebuilt.tar.gz -C "${OUTPUT_DIR}" .
           ls -la /workspace/prebuilt.tar.gz
           APBUILD
+          cat > "${RUNNER_TEMP}/headless_modelpkls.py" <<'PKLSCRIPT'
+          #!/usr/bin/env python3
+          """Headless build of the 6 GPU model pkls (the DEV=QCOM scons targets that need /dev/kgsl-3d0).
+          
+          Usage: headless_modelpkls.py <key> <build_dir> <out_dir>
+          
+          Mirrors the 6 tinygrad targets of openpilot/selfdrive/modeld/SConscript without a GPU:
+            1. capture each artifact under DEV=CPU:LLVM with the SConscript-identical commands
+               (+ --retargetable so no CPU binaries are embedded in the pkls)
+            2. retarget each capture to headless-precompiled QCOM:
+               - strip the CPU-rendered SOURCE/BINARY from every PROGRAM
+               - undo the CPU-conditional FDIV rewrite (the QCOM renderer has no FDIV codegen)
+               - rewrite device strings CPU -> QCOM (leaf args + specs + expected_input_info; NPY kept)
+               - re-render + compile under the 3X-equivalent context
+                 (QCOM:CL:a630,IMAGE_PITCH_ALIGNMENT=64, IMAGE=1, FLOAT16=1, OPENPILOT_HACKS=1;
+                 codegen is in-process libllvm-qcom on aarch64, no GPU)
+               - rewrite every PROGRAM target to the QCOM target
+               - dump (OOB model pkls: the weight blob must come out byte-identical;
+                 warp pkls: plain pickle with storage dropped so buffers allocate on the GPU at first use)
+            3. verify (reload, spec devices, every PROGRAM has a QCOM-target BINARY, blob identity)
+            4. write manifest.json (key + sha256 + bytes per pkl) and the 6 pkls to <out_dir>
+          
+          The retarget machinery was developed and validated as wf_validate/retarget_proto.py
+          (all 6 artifacts green: OOB weight blobs byte-identical to the CPU captures, buffer
+          shapes identical to the comma-4 reference pkls).
+          """
+          import hashlib
+          import json
+          import os
+          import pickle
+          import shutil
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          from dataclasses import replace as dreplace
+          from pathlib import Path
+          
+          KEY, BUILD_DIR, OUT_DIR = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+          BUILD_DIR, OUT_DIR = BUILD_DIR.resolve(), OUT_DIR.resolve()
+          assert (BUILD_DIR / "tinygrad_repo").is_dir(), f"no tinygrad_repo in {BUILD_DIR}"
+          assert (BUILD_DIR / "openpilot/selfdrive/modeld/SConscript").is_file(), "no modeld SConscript"
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+          
+          # Environment must be fixed before tinygrad is imported:
+          # DEV=CPU:LLVM -- OOB sidecar buffers reconstruct as views of a host buffer under the
+          #                 load-time DEFAULT; the capture subprocesses also run under this.
+          # PARALLEL=0   -- serial kernel compile (no multiprocessing pool): deterministic, matches
+          #                 the validated local runs; on aarch64 the QCOM codegen is in-process anyway.
+          os.environ["DEV"] = "CPU:LLVM"
+          os.environ["PARALLEL"] = "0"
+          sys.path.insert(0, str(BUILD_DIR / "tinygrad_repo"))  # tinygrad + examples.openpilot.helpers
+          sys.path.insert(0, str(BUILD_DIR))                    # openpilot.* (transformations, nv12_info)
+          
+          from tinygrad import Context, dtypes
+          from tinygrad.device import Buffer, Compiled, Device
+          from tinygrad.engine.realize import lower_and_compile
+          from tinygrad.uop.ops import Ops, PatternMatcher, UPat, graph_rewrite
+          
+          from examples.openpilot.helpers import dump_pickle, load_pickle
+          
+          ARCH = "a630,IMAGE_PITCH_ALIGNMENT=64"  # QCOMDevice arch with IMAGE=1 (the 3X build env)
+          COMPILE_CTX = dict(DEV=f"QCOM:CL:{ARCH}", IMAGE=1, FLOAT16=1, OPENPILOT_HACKS=1)
+          
+          # The 3X build captures with tg_flags='DEV=QCOM IMAGE=1 FLOAT16=1 NOLOCALS=1
+          # JIT_BATCH_SIZE=0 OPENPILOT_HACKS=1' (modeld SConscript, comma_arm64 branch). Mirror it
+          # exactly, swapping only the device (no GPU available): the graph-construction flags are
+          # what make the captured graph match what the device builds (FLOAT16 changes conv
+          # weight casting in mixin/op.py + folding in schedule/prepare.py; e.g. dm: full flags
+          # -> 49 kernels / 20.3 MB fp16 weight blob, matching the comma-4 reference, while plain
+          # DEV=CPU:LLVM gives a different 44-kernel / 8.9 MB fp32 graph). NOLOCALS/JIT_BATCH_SIZE
+          # are no-ops in tinygrad 92b742f -- kept for flag-string parity.
+          CAPTURE_FLAGS = dict(DEV="CPU:LLVM", IMAGE=1, FLOAT16=1, NOLOCALS=1, JIT_BATCH_SIZE=0, OPENPILOT_HACKS=1)
+          
+          # --- headless QCOM -------------------------------------------------------------
+          # The real QCOMDevice.__init__ opens /dev/kgsl-3d0 (the GPU), which the container does
+          # not have. Compilation only needs the renderers + arch, so rebind __init__ to a
+          # headless version that reuses the CPU allocator for alignment queries. Every
+          # Device["QCOM*"] instantiation goes through this (which is also why the
+          # Device["QCOM"].arch check in step 7 below holds).
+          import tinygrad.runtime.ops_qcom as _oq
+          from tinygrad.renderer.cstyle import QCOMCLRenderer
+          from tinygrad.renderer.nir import IR3Renderer
+          
+          def _headless_qcom_init(self, device=""):
+            Compiled.__init__(self, "QCOM", Device["CPU"].allocator, [QCOMCLRenderer, IR3Renderer], None, arch=ARCH)
+          
+          _oq.QCOMDevice.__init__ = _headless_qcom_init
+          _oq.QCOMDevice.finalize = lambda self: None
+          
+          # The OOB load (helpers.load_pickle, persistent_load = buffers.view(nbytes, off))
+          # recreates every sidecar buffer as a VIEW of one big buffer. Views are "unallocated"
+          # per Buffer.is_allocated, so dump_pickle's as_memoryview hits the copy_from assert.
+          # Materialize a view by slicing the root base's host bytes at the view's absolute
+          # offset (Buffer.view stores base=root, offset=absolute). Per-base cache: the big
+          # sidecar buffer is read once, then sliced per view. The bytes are exactly the
+          # source pkl's blob content, so the blob-identity check still holds.
+          _orig_as_memoryview = Buffer.as_memoryview
+          _base_mv_cache = {}
+          def _view_as_memoryview(self, allow_zero_copy=False):
+            if self._base is not None and (b := self.base) is not None and b.is_allocated():
+              if id(b) not in _base_mv_cache: _base_mv_cache[id(b)] = _orig_as_memoryview(b)
+              mv = _base_mv_cache[id(b)][self.offset:self.offset + self.nbytes]
+              return mv if allow_zero_copy else memoryview(bytearray(mv))
+            return _orig_as_memoryview(self, allow_zero_copy)
+          Buffer.as_memoryview = _view_as_memoryview
+          
+          # Compile-failure forensics: save the source of any kernel the QCOM compiler rejects.
+          # On aarch64 the QCOMCompiler compiles in-process, so this wrapper sees every failure.
+          from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
+          _FAILQ = OUT_DIR / "failq"
+          _orig_qcom_compile = QCOMCompiler.compile
+          def _qcom_compile_dbg(self, src):
+            try:
+              return _orig_qcom_compile(self, src)
+            except Exception as e:
+              n = getattr(self, "_dbg_n", 0); self._dbg_n = n + 1
+              saved = ""
+              try:
+                _FAILQ.mkdir(parents=True, exist_ok=True)
+                p = _FAILQ / f"failq_{os.getpid()}_{n}.cl"
+                p.write_text(src)
+                saved = f" saved={p}"
+              except Exception:
+                pass
+              print(f"QCOM-FAIL pid={os.getpid()} n={n} src_len={len(src)} exc={type(e).__name__}: {e}{saved}", flush=True)
+              raise
+          QCOMCompiler.compile = _qcom_compile_dbg
+          
+          # --- graph surgery ---------------------------------------------------------------
+          
+          # The CPU:LLVM capture ran full_rewrite_to_sink with the Clang renderer, which supports
+          # FDIV; its late rewrites (gated on `Ops.FDIV in ops`) turn the device-agnostic
+          # `a * (1/b)` into `a FDIV b`. The QCOM renderer has no FDIV codegen, and a QCOM capture
+          # (like the 3X build) never runs those rules -> its kernels carry `a * RECIPROCAL(b)`.
+          # Undo the CPU-conditional rewrite so the LINEAR we re-render is op-for-op what a QCOM
+          # capture produces.
+          PM_FDIV_CLEAN = PatternMatcher([
+            (UPat(Ops.FDIV, dtypes.floats, src=(UPat.var("a"), UPat.var("b")), name="u"),
+             lambda u, a, b: a.alu(Ops.MUL, b.alu(Ops.RECIPROCAL))),
+          ])
+          
+          # CPU PROGRAM (SINK, LINEAR, SOURCE[, BINARY]) -> (SINK, LINEAR): forces re-render of
+          # fresh source with the new renderer from the portable linearized kernel.
+          PM_STRIP = PatternMatcher([
+            (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE), UPat(Ops.BINARY)), name="p"),
+             lambda p: p.replace(src=p.src[:2]) if p.arg.target.device == "CPU" else None),
+            (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE)), name="p"),
+             lambda p: p.replace(src=p.src[:2]) if p.arg.target.device == "CPU" else None),
+          ])
+          
+          PM_DEVICE = PatternMatcher([
+            (UPat(Ops.PARAM, name="u"),
+             lambda u: u.replace(arg=dreplace(u.arg, device="QCOM")) if u.arg is not None and getattr(u.arg, "device", None) == "CPU" else None),
+            (UPat(Ops.BUFFER, name="u"),
+             lambda u: u.replace(arg=dreplace(u.arg, device="QCOM")) if u.arg is not None and getattr(u.arg, "device", None) == "CPU" else None),
+          ])
+          
+          def walk_devices(lin):
+            seen, stack, devs = set(), [lin], {}
+            while stack:
+              u = stack.pop()
+              if id(u) in seen: continue
+              seen.add(id(u))
+              d = u.device
+              if d is not None: devs[d] = devs.get(d, 0) + 1
+              stack.extend(u.src)
+            return devs
+          
+          def count_ops(lin, op):
+            """Manual walk. toposort() does NOT enter kernel bodies -- only this sees the whole
+            captured graph."""
+            n = 0; seen = set(); stack = [lin]
+            while stack:
+              u = stack.pop()
+              if id(u) in seen: continue
+              seen.add(id(u))
+              if u.op is op: n += 1
+              stack.extend(u.src)
+            return n
+          
+          # The cstyle renderer (cstyle._render) iterates a kernel's LINEAR list and looks up
+          # every rendered uop and every child in self.r -- so every uop reachable from a list
+          # element must itself be a list element, in topological order (KeyError otherwise).
+          # PM_FDIV_CLEAN swaps FDIV(a, b) -> MUL(a, RECIPROCAL(b)): the new MUL takes the FDIV's
+          # slot in the list, but the new RECIPROCAL children are not in it. Insert each missing
+          # uop immediately before its first consumer; the order stays valid because a missing
+          # uop's dependencies already precede the slot (b preceded the FDIV it replaced).
+          # Only kernel LINEARs are fixed (PROGRAM.src[1]) -- top-level LINEARs' children are
+          # CALLs whose whole bodies are intentionally not in their lists.
+          # (pm callbacks must be module-level: tinygrad asserts fxn.__closure__ is None)
+          LIN_FIX_STATE = {"inserted": 0}
+          
+          def fix_kernel_linear(p):
+            if not (len(p.src) >= 2 and p.src[1].op is Ops.LINEAR): return p
+            lin = p.src[1]
+            lst = list(lin.src)
+            in_list = set(lst)
+            missing = set()
+            for e in lst:
+              stack, seen = list(e.src), set()
+              while stack:
+                x = stack.pop()
+                if id(x) in seen: continue
+                seen.add(id(x))
+                if x not in in_list: missing.add(x)
+                stack.extend(x.src)
+            if not missing: return p
+            # the CPU render of the original list succeeded, so the only uops the FDIV clean
+            # can introduce off-list are the new RECIPROCALs -- fail loud otherwise
+            assert all(u.op is Ops.RECIPROCAL for u in missing), \
+              f"unexpected off-list uops after FDIV clean: {sorted({u.op.name for u in missing})}"
+            emitted, out = set(), []
+            for e in lst:
+              reach, stack, seen = [], [e], set()
+              while stack:
+                x = stack.pop()
+                if id(x) in seen: continue
+                seen.add(id(x))
+                if x in missing and x not in emitted: reach.append(x)
+                stack.extend(x.src)
+              if reach:
+                for m in reach:
+                  emitted.add(m); out.append(m)
+                LIN_FIX_STATE["inserted"] += len(reach)
+              out.append(e)
+            return p.replace(src=(p.src[0], lin.replace(src=tuple(out)), *p.src[2:]))
+          
+          PM_LINEAR_FIX = PatternMatcher([(UPat(Ops.PROGRAM, name="p"), fix_kernel_linear)])
+          
+          # The ctx parameter carries the QCOM target (closures are not supported in pm
+          # callbacks, so the target can't be captured -- pass it via graph_rewrite(ctx=...)).
+          def set_program_target(p, ctx):
+            arg = p.arg
+            if arg is None or getattr(arg, "target", None) is None: return p
+            if arg.target.device != "QCOM": return p.replace(arg=dreplace(arg, target=ctx))
+            return p
+          
+          PM_TARGET = PatternMatcher([(UPat(Ops.PROGRAM, name="p"), set_program_target)])
+          
+          def oob_tail(path):
+            with open(path, "rb") as f:
+              opcodes_len = struct.unpack("<q", f.read(8))[0]
+              opcodes = f.read(opcodes_len)
+              blob = f.read()
+            return opcodes, blob
+          
+          def collect_programs(lin):
+            seen, stack, progs = set(), [lin], []
+            while stack:
+              u = stack.pop()
+              if id(u) in seen: continue
+              seen.add(id(u))
+              if u.op is Ops.PROGRAM: progs.append(u)
+              stack.extend(u.src)
+            return progs
+          
+          def collect_buffers(obj):
+            """Every tinygrad Buffer referenced anywhere in the artifact (incl. _base chains).
+            UOp is @dataclass(slots=True): vars() is EMPTY on it (the instance dict is only the
+            recursive_property cache), so the walk must descend via dataclass fields, not vars().
+            (A vars()-only walk silently finds 0 buffers -> the plain-dump surgery becomes a no-op
+            and ships CPU buffers with live storage into the QCOM graph.)"""
+            import dataclasses
+            seen, out = set(), []
+            def rec(o):
+              if o is None or id(o) in seen: return
+              seen.add(id(o))
+              if isinstance(o, Buffer):
+                out.append(o)
+                if o._base is not None: rec(o._base)
+                return
+              if isinstance(o, dict):
+                for v in o.values(): rec(v)
+              elif isinstance(o, (list, tuple, set, frozenset)):
+                for v in o: rec(v)
+              elif dataclasses.is_dataclass(o):
+                for f in dataclasses.fields(o): rec(getattr(o, f.name, None))
+              elif not isinstance(o, type) and hasattr(o, "__dict__") and o.__dict__:
+                for v in vars(o).values(): rec(v)
+            rec(obj)
+            return out
+          
+          # --- retarget ---------------------------------------------------------------------
+          
+          def retarget(src, dst, oob):
+            with Context(DEV="CPU:LLVM"):
+              a = load_pickle(str(src), out_of_band=oob) if oob else pickle.load(open(src, "rb"))
+            blob_before = oob_tail(src)[1] if oob else None
+            print(f"[retarget] loaded {src.name}: specs={ {k: v[2] for k, v in a['input_specs'].items()} }", flush=True)
+          
+            # 1. undo the CPU-conditional FDIV decomps (see PM_FDIV_CLEAN)
+            lin = a["run"].captured._linear
+            nfdiv = count_ops(lin, Ops.FDIV)
+            lin = graph_rewrite(lin, PM_FDIV_CLEAN, walk=True, enter_calls=True)
+            nrecip = count_ops(lin, Ops.RECIPROCAL)
+            print(f"[retarget] fdiv clean: {nfdiv} FDIV -> {nrecip} RECIPROCAL in graph", flush=True)
+            assert count_ops(lin, Ops.FDIV) == 0, "FDIV survived clean"
+          
+            # 2. re-insert the introduced RECIPROCALs into each kernel's LINEAR list
+            LIN_FIX_STATE["inserted"] = 0
+            lin = graph_rewrite(lin, PM_LINEAR_FIX, walk=True, enter_calls=True)
+            print(f"[retarget] linear repair: inserted {LIN_FIX_STATE['inserted']} uops into kernel lists", flush=True)
+          
+            # 3. strip CPU source/binary from programs (fresh render in step 6)
+            lin = graph_rewrite(lin, PM_STRIP, walk=True, enter_calls=True)
+          
+            # 4. device rewrite (leaf args only; property propagates; NPY untouched)
+            lin = graph_rewrite(lin, PM_DEVICE, walk=True, enter_calls=True)
+            a["run"].captured._linear = lin
+            print("[retarget] post-rewrite devices:", walk_devices(lin), flush=True)
+          
+            # 5. spec rewrite (keep NPY)
+            for name in ("input_specs", "output_specs"):
+              if name not in a: continue
+              for k, (shape, dtype, dev) in a[name].items():
+                assert dev in ("CPU", "NPY"), (name, k, dev)
+                if dev == "CPU": a[name][k] = (shape, dtype, "QCOM")
+          
+            # 5b. CapturedJit.expected_input_info carries capture-time device strings
+            # (view, vars, dtype, device) and _TinyJit.__call__ (device side, cnt>=2) compares it
+            # against the fresh inputs' devices -> a "CPU" string raises JitError on-device.
+            # These are plain strings, not uops: the graph rewrites above cannot touch them.
+            _cj = a["run"].captured
+            _cj.expected_input_info = [
+              (ent[0], ent[1], ent[2], "QCOM" if ent[3] == "CPU" else ent[3]) for ent in _cj.expected_input_info
+            ]
+            print("[retarget] expected_input_info devices:", [e[3] for e in _cj.expected_input_info], flush=True)
+          
+            # 6. headless QCOM precompile (3X-equivalent context)
+            with Context(**COMPILE_CTX):
+              a["run"].captured._linear = lower_and_compile(a["run"].captured._linear, verbose=False)
+            print("[retarget] QCOM compile done", flush=True)
+          
+            # 7. ProgramInfo.target -> the QCOM target the compile used
+            qdev = Device["QCOM"]
+            assert qdev.renderers and qdev.arch == ARCH
+            qcom_target = next(iter(qdev.cached_renderer.values())).target
+            assert qcom_target.device == "QCOM" and qcom_target.arch == ARCH, qcom_target
+            a["run"].captured._linear = graph_rewrite(a["run"].captured._linear, PM_TARGET, ctx=qcom_target, walk=True, enter_calls=True)
+          
+            # 8. dump
+            if oob:
+              with Context(DEV="CPU:LLVM"):
+                dump_pickle(a, str(dst))
+            else:
+              # plain pickle (warp pkls): Buffer objects pickle their __dict__, so rewrite the
+              # device strings and drop storage (buffers re-allocate on the GPU at first use; the
+              # reference pkls embed capture-time bytes that are overwritten on the first frame
+              # anyway, so the storage-free form is behaviorally equivalent)
+              for b in collect_buffers(a):
+                if b.device == "CPU":
+                  b.device = "QCOM"
+                  b._storage = None
+              with open(dst, "wb") as f: pickle.dump(a, f)
+            print(f"[retarget] wrote {dst}", flush=True)
+          
+            verify(dst, oob, blob_before)
+          
+          def verify(dst, oob, blob_before):
+            with Context(DEV="CPU:LLVM"):
+              b = load_pickle(str(dst), out_of_band=oob) if oob else pickle.load(open(dst, "rb"))
+            # NPY is legitimate: dm warps capture with --transform-device NPY (the SConscript does
+            # too), and NPY specs/leaves are intentionally left alone
+            assert all(v[2] in ("QCOM", "NPY") for v in b["input_specs"].values()), b["input_specs"]
+            if "output_specs" in b: assert all(v[2] in ("QCOM", "NPY") for v in b["output_specs"].values())
+            lin2 = b["run"].captured._linear
+            devs2 = walk_devices(lin2)
+            print("[verify] reloaded devices:", devs2, flush=True)
+            assert "CPU" not in devs2, "CPU device strings survived"
+            # the underlying Buffer objects (ParamArg.buffer) must also be device-safe: on-device
+            # they are what exec_kernel ensure_allocates, so a leftover CPU buffer = host alloc in
+            # a GPU graph. Plain pkls must not ship storage either (Buffers pickle their __dict__).
+            # OOB pkls: the buffers are views of the single file-backed base; their device string is
+            # the load-time DEFAULT (QCOM on-device) by construction, so check the view structure.
+            bufs2 = collect_buffers(b)
+            print(f"[verify] buffers={len(bufs2)}", flush=True)
+            if oob:
+              roots = [x for x in bufs2 if x._base is None]
+              assert len(roots) == 1 and roots[0].is_allocated(), [repr(x) for x in roots]
+              root = roots[0]
+              def traces_to(x):
+                while x._base is not None: x = x._base
+                return x is root
+              badv = [x for x in bufs2 if not traces_to(x)]
+              print(f"[verify] oob root: {root!r} off-root={len(badv)}", flush=True)
+              assert not badv, [repr(x) for x in badv[:5]]
+            else:
+              badbuf = [x for x in bufs2 if x.device not in ("QCOM", "NPY")]
+              stored = [x for x in bufs2 if x._storage is not None and x.device != "NPY"]
+              print(f"[verify] bad_device={len(badbuf)} shipped_storage={len(stored)}", flush=True)
+              assert not badbuf, [repr(x) for x in badbuf[:5]]
+              assert not stored, [repr(x) for x in stored[:5]]
+            # 5b round-trip: the device-side JitError check must see only QCOM/NPY
+            badii = [e[3] for e in b["run"].captured.expected_input_info if e[3] not in ("QCOM", "NPY")]
+            assert not badii, badii
+            progs = collect_programs(lin2)
+            nbinary = sum(1 for p in progs if p.src and p.src[-1].op is Ops.BINARY)
+            badtarget = [p for p in progs if p.arg.target.device != "QCOM"]
+            print(f"[verify] programs={len(progs)} with_binary={nbinary} bad_target={len(badtarget)}", flush=True)
+            assert nbinary == len(progs) and len(progs) > 0 and not badtarget, "missing QCOM binaries/targets"
+            if oob:
+              _, blob_after = oob_tail(dst)
+              h1, h2 = hashlib.sha256(blob_before).hexdigest()[:16], hashlib.sha256(blob_after).hexdigest()[:16]
+              print(f"[verify] oob blob: before={len(blob_before)}B {h1}  after={len(blob_after)}B {h2}", flush=True)
+              assert h1 == h2, "OOB weight blob changed!"
+            print("[verify] ALL CHECKS PASSED", flush=True)
+          
+          # --- capture driver + main -----------------------------------------------------------
+          
+          def capture(cmd, build_dir):
+            """Run one capture script (SConscript-identical command, CPU branch) as a subprocess."""
+            env = dict(os.environ)
+            for k, v in CAPTURE_FLAGS.items(): env[k] = str(v)
+            # mirror the SConscript: lenv.PrependENVPath('PYTHONPATH', tinygrad_repo) on top of the
+            # inherited PYTHONPATH (= build_dir, exported by the build script)
+            env["PYTHONPATH"] = f"{build_dir / 'tinygrad_repo'}{os.pathsep}{build_dir}"
+            env["PARALLEL"] = "0"
+            print(f"[capture] $ {' '.join(str(c) for c in cmd)}", flush=True)
+            subprocess.run([str(c) for c in cmd], env=env, check=True)
+          
+          def compute_params(build_dir):
+            """The same imports openpilot/selfdrive/modeld/SConscript makes, so the capture
+            commands cannot drift from what a device build would run."""
+            from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
+            from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE, DM_INPUT_SIZE
+            from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+            camera_configs = [(c.width, c.height) for c in (_ar_ox_fisheye, _os_fisheye)]
+            return camera_configs, MEDMODEL_INPUT_SIZE, DM_INPUT_SIZE, get_nv12_info
+          
+          def main():
+            camera_configs, (model_w, model_h), (dm_w, dm_h), get_nv12_info = compute_params(BUILD_DIR)
+            print(f"[params] camera_configs={camera_configs} MEDMODEL_INPUT_SIZE=({model_w},{model_h}) "
+                  f"DM_INPUT_SIZE=({dm_w},{dm_h})", flush=True)
+          
+            compiler = BUILD_DIR / "tinygrad_repo/examples/openpilot"
+            models_dir = BUILD_DIR / "openpilot/selfdrive/modeld/models"
+            work = Path(tempfile.mkdtemp(prefix="pkls_"))
+            try:
+              # (final_name, capture_cmd, oob) -- SConscript-mirrored commands (+ --retargetable)
+              jobs = []
+              for onnx_name, pkl_name in (("dmonitoring_model.onnx", "dmonitoring_model_tinygrad.pkl"),
+                                          ("driving_supercombo.onnx", "driving_tinygrad.pkl")):
+                jobs.append((pkl_name,
+                             [sys.executable, compiler / "compile_onnx.py", models_dir / onnx_name,
+                              work / (pkl_name + ".cpu"), "--out-of-band", "--benchmark-runs", "1",
+                              "--retargetable"],
+                             True))
+              for cam_w, cam_h in camera_configs:
+                stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
+                jobs.append((f"driving_warp_{cam_w}x{cam_h}_tinygrad.pkl",
+                             [sys.executable, compiler / "compile_warp.py",
+                              "--frame", f"{cam_w},{cam_h},{stride},{y_height},{uv_height},{stride * (y_height + uv_height)}",
+                              "--warp-to", f"{model_w}x{model_h}", "--layout", "yuv420", "--frames", "2",
+                              "--retargetable", "--output", work / (f"driving_warp_{cam_w}x{cam_h}_tinygrad.pkl" + ".cpu")],
+                             False))
+              for cam_w, cam_h in camera_configs:
+                stride, y_height, uv_height, frame_size = get_nv12_info(cam_w, cam_h)
+                jobs.append((f"dm_warp_{cam_w}x{cam_h}_tinygrad.pkl",
+                             [sys.executable, compiler / "compile_warp.py",
+                              "--frame", f"{cam_w},{cam_h},{stride},{y_height},{uv_height},{frame_size}",
+                              "--warp-to", f"{dm_w}x{dm_h}", "--layout", "luma", "--border-fill", "16",
+                              "--transform-device", "NPY", "--retargetable",
+                              "--output", work / (f"dm_warp_{cam_w}x{cam_h}_tinygrad.pkl" + ".cpu")],
+                             False))
+          
+              # clean stale outputs (idempotent re-runs)
+              for pkl_name, _, _ in jobs: (OUT_DIR / pkl_name).unlink(missing_ok=True)
+              (OUT_DIR / "manifest.json").unlink(missing_ok=True)
+          
+              for i, (pkl_name, cmd, oob) in enumerate(jobs, 1):
+                print(f"===== [{i}/{len(jobs)}] {pkl_name} =====", flush=True)
+                capture(cmd, BUILD_DIR)
+                retarget(work / (pkl_name + ".cpu"), OUT_DIR / pkl_name, oob)
+          
+              manifest = {"key": KEY, "pkls": {}}
+              for pkl_name, _, _ in jobs:
+                data = (OUT_DIR / pkl_name).read_bytes()
+                assert len(data) > 0, pkl_name
+                manifest["pkls"][pkl_name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+                print(f"[manifest] {pkl_name} {len(data)}B {manifest['pkls'][pkl_name]['sha256'][:16]}", flush=True)
+              with open(OUT_DIR / "manifest.json", "w") as f:
+                json.dump(manifest, f, indent=2, sort_keys=True)
+              print(f"[manifest] wrote {OUT_DIR / 'manifest.json'} (key={KEY})", flush=True)
+              print("ALL 6 MODEL PKLS BUILT + VERIFIED", flush=True)
+            finally:
+              shutil.rmtree(work, ignore_errors=True)
+          
+          if __name__ == "__main__":
+            main()
+          PKLSCRIPT
           chmod +x "${RUNNER_TEMP}/ap_build.sh"
+
+      - name: Compute model-pkl cache key
+        id: pklkey
+        run: |
+          # The key is everything that goes into the 6 pkls: the tinygrad gitlink + its full
+          # tree, the modeld SConscript + both ONNX models + the transformation/nv12 params,
+          # the QCOM compile flags, the AGNOS rootfs hash_raw (libllvm-qcom + libLLVM + the
+          # venv's python come from it), the uv.lock (venv contents), and the pipeline
+          # script itself. Any change -> new key -> cache miss -> rebuild. Over-invalidation
+          # is cheap (a rebuild is ~15 min); a stale cache is not.
+          TG_GITLINK=$(git rev-parse HEAD:tinygrad_repo)
+          TG_TREE=$(git -C tinygrad_repo ls-tree -r HEAD)
+          MODEL_BLOBS=$(git ls-tree -r HEAD -- \
+            openpilot/selfdrive/modeld/SConscript \
+            openpilot/selfdrive/modeld/models/dmonitoring_model.onnx \
+            openpilot/selfdrive/modeld/models/driving_supercombo.onnx \
+            openpilot/common/transformations \
+            openpilot/system/camerad/cameras/nv12_info.py)
+          TG_FLAGS='DEV=QCOM IMAGE=1 FLOAT16=1 NOLOCALS=1 JIT_BATCH_SIZE=0 OPENPILOT_HACKS=1'
+          SCRIPT_SHA=$(sha256sum "${RUNNER_TEMP}/headless_modelpkls.py" | cut -d' ' -f1)
+          KEY=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$TG_GITLINK" "$TG_TREE" "$MODEL_BLOBS" "$TG_FLAGS" "${{ steps.agnos.outputs.hash_raw }}" "$SCRIPT_SHA" "${{ steps.venvkey.outputs.lockhash }}" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "model pkl cache key=$KEY"
+          echo "  tinygrad=$TG_GITLINK agnos=${{ steps.agnos.outputs.hash_raw }} script=${SCRIPT_SHA} lock=${{ steps.venvkey.outputs.lockhash }}"
+
+      - name: Fetch model pkls from release-asset cache
+        id: pklfetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          ASSET="modelpkls_${{ steps.pklkey.outputs.key }}.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/pkls"
+          if gh release view pkl-cache --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
+            echo "cache HIT: $ASSET"
+            gh release download pkl-cache --pattern "$ASSET" --dir "${RUNNER_TEMP}/pkls"
+            tar xzf "${RUNNER_TEMP}/pkls/$ASSET" -C "${RUNNER_TEMP}/pkls"
+            rm -f "${RUNNER_TEMP}/pkls/$ASSET"
+            ls -la "${RUNNER_TEMP}/pkls"
+            echo "hit=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache MISS: $ASSET (the pipeline will run in the build container)"
+            echo "hit=0" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build in AGNOS container
         run: |
@@ -410,7 +1000,27 @@ jobs:
             -v "${RUNNER_TEMP}/cache:/data/cache" \
             -v "${RUNNER_TEMP}/venv:/root/venv" \
             -v "${RUNNER_TEMP}/ap_build.sh:/build.sh:ro" \
+            -v "${RUNNER_TEMP}/headless_modelpkls.py:/headless_modelpkls.py:ro" \
+            -v "${RUNNER_TEMP}/pkls:/pkls" \
+            -e PKL_KEY="${{ steps.pklkey.outputs.key }}" \
             ap-agnos:local bash /build.sh
+
+      - name: Publish model pkls to release-asset cache (miss only)
+        if: steps.pklfetch.outputs.hit == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          ASSET="modelpkls_${{ steps.pklkey.outputs.key }}.tar.gz"
+          # The pipeline verified every pkl (reload + full check suite); the tar
+          # (manifest.json + the 6 pkls) is the cache unit.
+          tar czf "$ASSET" -C "${RUNNER_TEMP}/pkls" .
+          ls -lh "$ASSET"
+          gh release view pkl-cache >/dev/null 2>&1 || \
+            gh release create pkl-cache --title "Model pkl cache" \
+              --notes "Headless-built GPU model pkls for the ARM CI. One asset per model-input key; each tar.gz holds manifest.json (key + sha256 + bytes) + the 6 pkls."
+          gh release upload pkl-cache "$ASSET" --clobber
+          echo "published $ASSET"
 
       - name: Release docker image + build dir (14 GB disk)
         run: |
