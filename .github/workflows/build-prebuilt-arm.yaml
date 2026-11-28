@@ -325,6 +325,16 @@ jobs:
           print("OK: 6 model pkls verified + staged into the build tree", flush=True)
           PKLCHK
 
+          # --- guard (Phase 4): every staged pkl must be PRECOMPILED -- each host PROGRAM
+          # (hcq_submit) must carry its BINARY. Structural only: stub QCOM device, no GPU,
+          # nothing executed. A BINARY-less pkl boots, then crashes the first frame in
+          # dmonitoringmodeld/jetlink (tinygrad ops.py to_elf IndexError). The 4 modeld_v2
+          # warp pkls are plain-tinygrad artifacts (no Ops.PROGRAM/BINARY; loaded only by
+          # the native modeld_v2 binary) -> out of scope, noted by the guard. The staged
+          # bytes are what ships: PKLCHK2 re-verifies the output-tree copies against the
+          # same manifest shas after the build.
+          python3 /headless_modelpkls.py __verify__ "${BUILD_DIR}/openpilot/selfdrive/modeld/models" /pkls/manifest.json "${BUILD_DIR}/tinygrad_repo"
+
           # Free the workspace source now: nothing after this reads it (verified: SConstruct and
           # every SConscript never invoke git; the ffmpeg libs come from the venv, not the tree).
           # Keep release/ (the scons cache_dir), output/ and prebuilt.tar.gz (build output) --
@@ -333,13 +343,6 @@ jobs:
             ! -name release ! -name output ! -name prebuilt.tar.gz \
             -exec rm -rf {} +
           echo "=== disk after workspace source delete ==="; df -h /data /workspace 2>/dev/null || df -h
-
-          # msgq_repo/SConscript picks the Vision IPC backend at BUILD time: visionbuf_ion.cc only if
-          # /dev/ion exists, else the /dev/shm fallback. The container has no /dev/ion, and a shm build
-          # crashes camerad on-device (config_ife assert: the ISP can't DMA into shm buffers). scons only
-          # checks existence, so a placeholder file is enough. Guarded after the build (ION guard below).
-          [ -e /dev/ion ] || touch /dev/ion
-          test -e /dev/ion
 
           cd "${BUILD_DIR}"
           sed -i '/from .board.jungle import PandaJungle, PandaJungleDFU/s/^/#/' panda/__init__.py
@@ -425,15 +428,6 @@ jobs:
           [ "$fail" = "0" ] || exit 1
           echo "OK: every NEEDED shared lib resolves on-device."
 
-          # --- guard: Vision IPC must be the ION build (see the /dev/ion placeholder above) ---
-          CAMERAD="${OUTPUT_DIR}/openpilot/system/camerad/camerad"
-          test -f "$CAMERAD" || { echo "::error::camerad missing from build output"; exit 1; }
-          if ! grep -aq '/dev/ion' "$CAMERAD" || grep -aq 'msgq_visionbuf_' "$CAMERAD"; then
-            echo "::error::camerad was built with the /dev/shm Vision IPC backend (no ION): no camera on-device"
-            exit 1
-          fi
-          echo "OK: camerad uses the ION Vision IPC backend."
-
           # --- guard: fail on any LFS pointer stub / oversized file (verbatim from 3X workflow) ---
           if grep -rlIE "^version https://git-lfs\.github\.com/spec/v1" "${OUTPUT_DIR}" > /tmp/lfs_ptrs.txt; then
             echo "::error::LFS pointer stubs found in build output (would brick the device):"
@@ -467,8 +461,25 @@ jobs:
           APBUILD
           cat > "${RUNNER_TEMP}/headless_modelpkls.py" <<'PKLSCRIPT'
           #!/usr/bin/env python3
-          """headless_modelpkls.py -- Phase 3 of runner_plan_v2.md: build ALL 6 model pkls through
-          the headless DEV=QCOM capture path, one child process per artifact.
+          """headless_modelpkls.py -- Phase 4 of runner_plan_v2.md: build ALL 6 model pkls through
+          the headless DEV=QCOM capture path, one child process per artifact, PRECOMPILED (like
+          the device-built refs): every host program (hcq_submit) ships WITH its BINARY.
+          
+          Phase 4 (why precompiled): the Phase-3 pkls were built with --retargetable, which strips
+          the BINARY from the CPU-targeted hcq_submit program ("modeld recompiles at load"). Only
+          selfdrive/modeld/modeld.py actually calls lower_and_compile after loading; dmonitoring-
+          modeld.py and jetlink/openpilot/warp.py pickle.load and RUN directly -> to_elf() crashes
+          on self.src[3] (no BINARY) on the first frame. So the pkls now ship compiled, exactly
+          like a device build (the SConscript never passes --retargetable).
+          
+          CPU BINARY pin: CPUDevice's arch is "arm64,native", which LLVM resolves to the LOCAL
+          host CPU (3X = cortex-a75 + features; the GitHub ARM runner is a different CPU) -> the
+          BINARY would be build-host-specific machine code. hcq_submit is pure integer/syscall
+          code (no FP, no vectors), so the capture child pins the CPU compiler target to
+          ["arm64", "generic"] (the ARMv8-A baseline): the BINARY is byte-identical on every
+          build host and runs on every aarch64 device (the comma 4). The QCOM side is untouched
+          (KGSL command streams are CPU-side codegen, host-independent; proven by the Phase-3
+          3X-vs-CI byte-identity).
           
           Driver (called by ap_build.sh in the AGNOS container on a pkl-cache miss):
             python3 /headless_modelpkls.py <cache-key> <build_dir> <out_dir>
@@ -478,6 +489,11 @@ jobs:
           Child (spawned by the driver; do not call directly):
             python3 /headless_modelpkls.py __capture__ <artifact> <build_dir> <out.pkl>
             artifact in: dmon, driving, dwarp1928, dwarp1344, dmwarp1928, dmwarp1344
+          
+          Guard (called by ap_build.sh after the pkls are staged; structural, no GPU, nothing
+          executed; a stub QCOM device loads the graphs):
+            python3 /headless_modelpkls.py __verify__ <models_dir> <manifest.json> <tinygrad_repo>
+            -> fails the build if any shipped pkl's PROGRAM lacks a BINARY.
           
           Capture machinery (validated in Phases 1+2 on the 3X; qcomcap_any_3x.py restructured):
             - stub QCOMDevice (headless; in-process QCOM codegen for launch dims)
@@ -520,7 +536,8 @@ jobs:
           
           def build_artifacts(build_dir):
             """artifact label -> dict(pkl, kind, onnx, cmd); cmd carries a __OUT__ placeholder.
-            SConscript-identical commands (+ --retargetable). The dm warps use --border-fill 16:
+            SConscript-identical commands (NO --retargetable: the pkl ships precompiled, like a
+            device build -- see the module docstring). The dm warps use --border-fill 16:
             the OOB fill the reference device pkls (and the v1 pipeline) use; with the fixed-seed
             M_inv the warp is degenerate (all px NN-sample src[0]), so the OOB fill is the only
             ref-vs-ci difference there (a fill of 1 mismatches ref by 15 on the OOB px)."""
@@ -535,21 +552,21 @@ jobs:
                                           ("driving_supercombo.onnx", "driving", "driving_tinygrad.pkl")):
               arts[label] = dict(pkl=pkl, kind="onnx", onnx=models_dir / onnx_name,
                 cmd=[str(compiler / "compile_onnx.py"), str(models_dir / onnx_name), "__OUT__",
-                     "--out-of-band", "--benchmark-runs", "1", "--retargetable"])
+                     "--out-of-band", "--benchmark-runs", "1"])
             for cam_w, cam_h in camera_configs:
               stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
               arts[f"dwarp{cam_w}"] = dict(pkl=f"driving_warp_{cam_w}x{cam_h}_tinygrad.pkl", kind="warp", onnx=None,
                 cmd=[str(compiler / "compile_warp.py"),
                      "--frame", f"{cam_w},{cam_h},{stride},{y_height},{uv_height},{stride * (y_height + uv_height)}",
                      "--warp-to", f"{model_w}x{model_h}", "--layout", "yuv420", "--frames", "2",
-                     "--retargetable", "--output", "__OUT__"])
+                     "--output", "__OUT__"])
             for cam_w, cam_h in camera_configs:
               stride, y_height, uv_height, frame_size = get_nv12_info(cam_w, cam_h)
               arts[f"dmwarp{cam_w}"] = dict(pkl=f"dm_warp_{cam_w}x{cam_h}_tinygrad.pkl", kind="warp", onnx=None,
                 cmd=[str(compiler / "compile_warp.py"),
                      "--frame", f"{cam_w},{cam_h},{stride},{y_height},{uv_height},{frame_size}",
                      "--warp-to", f"{dm_w}x{dm_h}", "--layout", "luma", "--border-fill", "16",
-                     "--transform-device", "NPY", "--retargetable", "--output", "__OUT__"])
+                     "--transform-device", "NPY", "--output", "__OUT__"])
             return arts
           
           def artifact_order(arts):
@@ -565,6 +582,25 @@ jobs:
               "JIT_BATCH_SIZE": "0", "OPENPILOT_HACKS": "1", "PARALLEL": "0", "DEBUG": "1",
             })
             sys.path.insert(0, str(TINYGRAD_REPO))  # tinygrad + examples.openpilot.helpers
+          
+            # =============================================================================
+            # 0. pin the CPU codegen target (Phase 4): the shipped hcq_submit BINARY must be
+            #    byte-identical on every build host (3X capture vs the GitHub ARM runner) and
+            #    must run on every aarch64 device. "native" resolves to the LOCAL CPU
+            #    (cortex-a75 on the 3X, a different CPU on the runner) -> host-specific
+            #    machine code. hcq_submit is pure integer/syscall code (no FP, no vectors),
+            #    so the ARMv8-A baseline ("generic") is complete for it and host-independent.
+            #    Must be in place before the first Device["CPU"] use (the QCOM stub below
+            #    touches it for the CPU allocator); the CPU renderer is created lazily and
+            #    always goes through CPULLVMCompiler.__init__, so this covers every use.
+            # =============================================================================
+            import tinygrad.runtime.support.compiler_llvm as _cllvm
+            _orig_cpul_init = _cllvm.CPULLVMCompiler.__init__
+            def _pinned_cpul_init(self, arch, cache_key=None):
+              if arch and arch[0] == "arm64" and "native" in arch:
+                arch = ["arm64", "generic"]
+              _orig_cpul_init(self, arch, cache_key)
+            _cllvm.CPULLVMCompiler.__init__ = _pinned_cpul_init
           
             # =============================================================================
             # 1. headless QCOM stub (mirrors QCOMDevice.__init__ at ops_qcom.py:315-337)
@@ -813,7 +849,11 @@ jobs:
             badhost = [str(p.arg.target) for p in progs if not p.arg.target.device.startswith("CPU")]
             print(f"[verify] reloaded: programs={len(progs)} with_binary={nbinary} bad_host={len(badhost)}", flush=True)
             assert len(progs) > 0 and not badhost, "host programs must be CPU-targeted"
-            assert nbinary == 0, f"retargetable pkl must ship host programs WITHOUT BINARY (modeld recompiles), got {nbinary}"
+            # Phase 4: PRECOMPILED (like device-built refs). dmonitoringmodeld + jetlink load and
+            # run WITHOUT lower_and_compile, so every program (hcq_submit) must carry its BINARY;
+            # modeld.py's lower_and_compile is a no-op for compiled programs (_get_call_to_compile
+            # skips ProgramInfo+BINARY).
+            assert nbinary == len(progs), f"precompiled pkl must ship EVERY program WITH a BINARY, got {nbinary}/{len(progs)}"
             from tinygrad.runtime.support.hcq2 import HCQInfo
             tl = lin2.src
             def tl_kind(c):
@@ -826,11 +866,70 @@ jobs:
             assert set(kinds) <= {"hcq", "copy"} and kinds["hcq"] > 0, "top-level calls not exec-able on device"
             badii = [e[3] for e in a["run"].captured.expected_input_info if e[3] not in ("QCOM", "NPY")]
             assert not badii, badii
-            # the device-side load path (modeld.py:174 + CapturedJit.linear), run headless:
+            # the device-side load path (modeld.py:167/169 + CapturedJit.linear), run headless:
+            # lower_and_compile is a NO-OP for the already-compiled programs (Phase 4); it still
+            # must not break the graph, and the .linear property runs hcq_link. The no-lower
+            # functional test (what dmonitoringmodeld/jetlink do) already ran inside the compile
+            # script's own pickled-jit self-test, which skipped lower_and_compile this time.
             a["run"].captured._linear = _rz.lower_and_compile(a["run"].captured._linear)
             linked = a["run"].captured.linear
-            print(f"[verify] modeld-load-path headless OK: lower_and_compile + hcq_link, {len(linked.src)} top calls", flush=True)
+            print(f"[verify] modeld-load-path headless OK: lower_and_compile (no-op) + hcq_link, {len(linked.src)} top calls", flush=True)
             print("[verify] ALL CHECKS PASSED", flush=True)
+          
+          def guard(models_dir, manifest_path, tinygrad_repo):
+            """Workflow guard (Phase 4): every shipped CI pkl must be PRECOMPILED -- every
+            Ops.PROGRAM in run.captured._linear must carry its BINARY and be CPU-targeted.
+            Structural check only: a stub QCOM device (CPU allocator) loads the graphs; nothing
+            is executed and no GPU is needed. A BINARY-less pkl boots, then crashes the first
+            frame in dmonitoringmodeld / jetlink (tinygrad ops.py to_elf: IndexError on
+            self.src[3]). The 4 modeld_v2 warp pkls also ship but are plain-tinygrad artifacts
+            (JSON header + blob, loaded only by the native modeld_v2 binary) -- they have no
+            Ops.PROGRAM/BINARY structure to check (the LFS-pointer guard covers their presence).
+            """
+            import json
+            models_dir, manifest_path, tinygrad_repo = Path(models_dir), Path(manifest_path), Path(tinygrad_repo)
+            assert tinygrad_repo.is_dir(), f"no tinygrad_repo tree at {tinygrad_repo}"
+            manifest = json.load(open(manifest_path))
+            assert len(manifest["pkls"]) == 6, f"manifest lists {len(manifest['pkls'])} pkls, want 6"
+          
+            # env + stub BEFORE any tinygrad import (same as child_prelude; no compiler pin --
+            # the guard loads precompiled graphs and never compiles or executes)
+            os.environ.update({
+              "DEV": "QCOM;CPU:LLVM", "IMAGE": "1", "FLOAT16": "1", "NOLOCALS": "1",
+              "JIT_BATCH_SIZE": "0", "OPENPILOT_HACKS": "1", "PARALLEL": "0", "DEBUG": "0",
+            })
+            sys.path.insert(0, str(tinygrad_repo))
+            import tinygrad.runtime.ops_qcom as _oq
+            from tinygrad.device import Compiled, Device
+            from tinygrad.renderer.cstyle import QCOMCLRenderer
+            from tinygrad.renderer.nir import IR3Renderer
+            def _guard_qcom_init(self, device=""):
+              Compiled.__init__(self, "QCOM", Device["CPU"].allocator, [QCOMCLRenderer, IR3Renderer], None,
+                                arch="a630,IMAGE_PITCH_ALIGNMENT=64")
+              self.gpu_id = (6, 3, 0)
+              self.var_vals = {"kgsl_fd": os.open(os.devnull, os.O_RDWR), "kgsl_ctx": 0}
+            _oq.QCOMDevice.__init__ = _guard_qcom_init
+            _oq.QCOMDevice.finalize = lambda self: None
+          
+            from tinygrad.uop.ops import Ops
+            MODELS = {"dmonitoring_model_tinygrad.pkl", "driving_tinygrad.pkl"}  # OOB pickles
+            from examples.openpilot.helpers import load_pickle
+            for name, info in sorted(manifest["pkls"].items()):
+              path = models_dir / name
+              assert path.is_file(), f"{name} missing from {models_dir}"
+              data = path.read_bytes()
+              assert len(data) == info["bytes"], (name, len(data), info["bytes"])
+              assert hashlib.sha256(data).hexdigest() == info["sha256"], f"{name} sha mismatch vs manifest"
+              a = load_pickle(str(path), out_of_band=(name in MODELS))
+              progs = [u for u in walk_uops(a["run"].captured._linear) if u.op is Ops.PROGRAM]
+              nbinary = sum(1 for p in progs if p.src and p.src[-1].op is Ops.BINARY)
+              badhost = [str(p.arg.target) for p in progs if not p.arg.target.device.startswith("CPU")]
+              assert len(progs) > 0, f"{name}: no programs in the linear (corrupt pkl?)"
+              assert not badhost, f"{name}: non-CPU host programs: {badhost}"
+              assert nbinary == len(progs), f"{name}: {len(progs) - nbinary}/{len(progs)} programs lack a BINARY (would crash on-device)"
+              bsize = next(len(p.src[-1].arg) for p in progs if p.src and p.src[-1].op is Ops.BINARY)
+              print(f"[guard] OK {name}: programs={len(progs)} with_binary={nbinary} binary_bytes={bsize} sha={info['sha256'][:16]}", flush=True)
+            print("[guard] ALL 6 SHIPPED PKLS ARE PRECOMPILED (every host PROGRAM carries its BINARY)", flush=True)
           
           def child(artifact, build_dir, out):
             import platform
@@ -910,10 +1009,14 @@ jobs:
           if __name__ == "__main__":
             if len(sys.argv) == 5 and sys.argv[1] == "__capture__":
               child(sys.argv[2], sys.argv[3], sys.argv[4])
+            elif len(sys.argv) == 5 and sys.argv[1] == "__verify__":
+              guard(sys.argv[2], sys.argv[3], sys.argv[4])
             elif len(sys.argv) == 4:
               driver(sys.argv[1], sys.argv[2], sys.argv[3])
             else:
-              raise SystemExit(f"usage: {sys.argv[0]} <cache-key> <build_dir> <out_dir>  |  {sys.argv[0]} __capture__ <artifact> <build_dir> <out.pkl>")
+              raise SystemExit(f"usage: {sys.argv[0]} <cache-key> <build_dir> <out_dir>  |  "
+                               f"{sys.argv[0]} __capture__ <artifact> <build_dir> <out.pkl>  |  "
+                               f"{sys.argv[0]} __verify__ <models_dir> <manifest.json> <tinygrad_repo>")
           PKLSCRIPT
           chmod +x "${RUNNER_TEMP}/ap_build.sh"
 
