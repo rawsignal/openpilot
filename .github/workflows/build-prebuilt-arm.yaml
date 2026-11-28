@@ -344,6 +344,13 @@ jobs:
             -exec rm -rf {} +
           echo "=== disk after workspace source delete ==="; df -h /data /workspace 2>/dev/null || df -h
 
+          # msgq_repo/SConscript picks the Vision IPC backend at BUILD time: visionbuf_ion.cc only if
+          # /dev/ion exists, else the /dev/shm fallback. The container has no /dev/ion, and a shm build
+          # crashes camerad on-device (config_ife assert: the ISP can't DMA into shm buffers). scons only
+          # checks existence, so a placeholder file is enough. Guarded after the build (ION guard below).
+          [ -e /dev/ion ] || touch /dev/ion
+          test -e /dev/ion
+
           cd "${BUILD_DIR}"
           sed -i '/from .board.jungle import PandaJungle, PandaJungleDFU/s/^/#/' panda/__init__.py
 
@@ -427,6 +434,15 @@ jobs:
           done < <(find "${OUTPUT_DIR}" -type f -perm -u+x)
           [ "$fail" = "0" ] || exit 1
           echo "OK: every NEEDED shared lib resolves on-device."
+
+          # --- guard: Vision IPC must be the ION build (see the /dev/ion placeholder above) ---
+          CAMERAD="${OUTPUT_DIR}/openpilot/system/camerad/camerad"
+          test -f "$CAMERAD" || { echo "::error::camerad missing from build output"; exit 1; }
+          if ! grep -aq '/dev/ion' "$CAMERAD" || grep -aq 'msgq_visionbuf_' "$CAMERAD"; then
+            echo "::error::camerad was built with the /dev/shm Vision IPC backend (no ION): no camera on-device"
+            exit 1
+          fi
+          echo "OK: camerad uses the ION Vision IPC backend."
 
           # --- guard: fail on any LFS pointer stub / oversized file (verbatim from 3X workflow) ---
           if grep -rlIE "^version https://git-lfs\.github\.com/spec/v1" "${OUTPUT_DIR}" > /tmp/lfs_ptrs.txt; then
