@@ -1,0 +1,283 @@
+import sys
+import types
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+from opendbc.car import gen_empty_fingerprint, structs
+from opendbc.car.rivian.carcontroller import ACM_ENGAGE_TIMEOUT_FRAMES, CarController
+from opendbc.car.rivian.fingerprints import FW_VERSIONS
+from opendbc.car.rivian.values import CAR, FW_QUERY_CONFIG, WMI, ModelLine, ModelYear, RivianSafetyFlags
+
+GearShifter = structs.CarState.GearShifter
+
+
+def _long_cp():
+  # a real Rivian CarParams (mass, wheelbase and so on, as the car controller's vehicle model needs), on openpilot long
+  from opendbc.car.rivian.interface import CarInterface
+  cp = CarInterface.get_non_essential_params(CAR.RIVIAN_R1)
+  cp.openpilotLongitudinalControl = True
+  return cp
+
+
+class TestRivian(unittest.TestCase):
+  def test_custom_fuzzy_fingerprinting(self):
+    for platform in CAR:
+      with self.subTest(platform=platform.name):
+        for wmi in WMI:
+          for line in ModelLine:
+            for year in ModelYear:
+              for bad in (True, False):
+                vin = ["0"] * 17
+                vin[:3] = wmi
+                vin[3] = line.value
+                vin[9] = year.value
+                if bad:
+                  vin[3] = "Z"
+                vin = "".join(vin)
+
+                matches = FW_QUERY_CONFIG.match_fw_to_car_fuzzy({}, vin, FW_VERSIONS)
+                should_match = year in platform.config.years and not bad
+                assert (matches == {platform}) == should_match, "Bad match"
+
+
+class TestBlockedEngagePress(unittest.TestCase):
+  """The ACC stalk is also the gear selector: only a stalk-down in Drive may be reported as a blocked ACC press
+  (route ad521a7f5fe6d46a/00000010--2fee7b61ca: D -> R -> D while parking turned MADS on)."""
+
+  ADAS_SIGNALS = ("VDM_AdasStatus_Checksum", "VDM_AdasStatus_Counter", "VDM_AdasDecelLimit", "VDM_AdasDriverAccelPriorityStatus",
+                  "VDM_AdasFaultStatus", "VDM_AdasAccelLimit", "VDM_AdasDriverModeStatus", "VDM_AdasUnkown1",
+                  "VDM_AdasInterfaceStatus", "VDM_AdasVehicleHoldStatus", "VDM_UserAdasRequest")
+
+  def _run(self, seq, engageable=False):
+    # seq: (gear, VDM_UserAdasRequest) per frame. Returns the frames that raised engage_request_blocked.
+    CP = _long_cp()
+    CC = CarController({"pt": "rivian_primary_actuator"}, CP, structs.CarParamsSP())
+    CC.openpilot_engageable = engageable
+    CS = SimpleNamespace(acm_lka_hba_cmd={"ACM_hbaSysState": 0, "ACM_hbaLamp": 0, "ACM_hbaOnOffState": 0, "ACM_slifOnOffState": 0},
+                         sccm_wheel_touch={"SCCM_WheelTouch_Counter": 0, "SCCM_WheelTouch_HandsOn": 0,
+                                           "SCCM_WheelTouch_CapacitiveValue": 0, "SCCM_WheelTouch_Calibration": 100,
+                                           "SCCM_WheelTouch_ResistiveValue": 0},
+                         toi_fault=False, torque_tx_refused=False, hands_on_level=1, eac_status=1, eac_error_code=0,
+                         acm_fault_supervisor_state=0)
+    raised = []
+    for frame, (gear, request) in enumerate(seq):
+      CS.out = structs.CarState(gearShifter=gear, vEgo=0.3, vEgoRaw=0.3)
+      CS.vdm_adas_status = [dict(dict.fromkeys(self.ADAS_SIGNALS, 0), VDM_UserAdasRequest=request)]
+      CC.update(structs.CarControl().as_reader(), structs.CarControlSP(), CS, 0)
+      if CC.engage_request_blocked:
+        raised.append(frame)
+        CC.engage_request_blocked = False
+    return raised
+
+  def test_gear_changes_are_not_engage_presses(self):
+    D, R, P = GearShifter.drive, GearShifter.reverse, GearShifter.park
+    self.assertEqual(self._run([(D, 0), (D, 2), (R, 2), (R, 0)]), [])  # D -> R, stalk up
+    self.assertEqual(self._run([(R, 0), (R, 4), (D, 4), (D, 0)]), [])  # R -> D, stalk down
+    self.assertEqual(self._run([(P, 0), (P, 3), (D, 3), (D, 4), (D, 0)]), [])  # P -> D
+    self.assertEqual(self._run([(D, 0), (D, 1), (D, 0)]), [])  # cancel
+
+  def test_acc_press_in_drive_is_reported(self):
+    D = GearShifter.drive
+    self.assertEqual(self._run([(D, 0), (D, 3), (D, 4), (D, 0)]), [1])
+    self.assertEqual(self._run([(D, 0), (D, 4), (D, 0), (D, 4), (D, 0)]), [1, 3])
+    # openpilot can engage: the press goes to the ACM, nothing to report
+    self.assertEqual(self._run([(D, 0), (D, 4), (D, 0)], engageable=True), [])
+
+
+class TestLongitudinalNeedsHarness(unittest.TestCase):
+  """A leftover AlphaLongitudinalEnabled must not turn on openpilot longitudinal without the longitudinal harness:
+  panda would drop the 0x162 cancel path while nothing on the truck accepts the 0x160 request."""
+
+  @staticmethod
+  def _get(fingerprint_bus1):
+    # the SP extension imports openpilot params and MADS helpers, which the Mac test venv does not have
+    stubs = {name: types.ModuleType(name) for name in ("openpilot", "openpilot.common", "openpilot.common.params",
+                                                       "openpilot.sunnypilot", "openpilot.sunnypilot.mads",
+                                                       "openpilot.sunnypilot.mads.helpers")}
+    stubs["openpilot.common.params"].Params = object
+    stubs["openpilot.sunnypilot.mads.helpers"].MadsSteeringModeOnBrake = object
+    stubs["openpilot.sunnypilot.mads.helpers"].read_steering_mode_param = lambda *a, **k: None
+    with mock.patch.dict(sys.modules, stubs):
+      from opendbc.car.rivian.interface import CarInterface
+    fingerprint = gen_empty_fingerprint()
+    fingerprint[0] = {0x321: 7}
+    fingerprint[1] = dict.fromkeys(fingerprint_bus1, 8)
+    CP = CarInterface.get_params(CAR.RIVIAN_R1, fingerprint, [], True, False, False)
+    CarInterface.get_params_sp(CP, CAR.RIVIAN_R1, fingerprint, [], True, False, False)
+    return CP
+
+  def test_no_harness_no_openpilot_long(self):
+    CP = self._get([0x1310])
+    self.assertFalse(CP.openpilotLongitudinalControl)
+    self.assertFalse(CP.safetyConfigs[0].safetyParam & RivianSafetyFlags.LONG_CONTROL)
+
+  def test_harness_allows_openpilot_long(self):
+    CP = self._get([0x1310, 0x131a])
+    self.assertTrue(CP.openpilotLongitudinalControl)
+    self.assertTrue(CP.safetyConfigs[0].safetyParam & RivianSafetyFlags.LONG_CONTROL)
+
+class TestDeclinedEngagePress(unittest.TestCase):
+  """An ACC press openpilot passed on but the stock ACM did not take: report the likely reason once, after 0.5 s."""
+
+  ADAS_SIGNALS = TestBlockedEngagePress.ADAS_SIGNALS
+
+  def _run(self, seq, v_ego=5.0, supervisor_state=0, acc_engages_at=None):
+    # seq: (gear, VDM_UserAdasRequest) per frame, padded with idle frames in Drive. Returns (frame, reason) reports.
+    CP = _long_cp()
+    CC = CarController({"pt": "rivian_primary_actuator"}, CP, structs.CarParamsSP())
+    CS = SimpleNamespace(acm_lka_hba_cmd={"ACM_hbaSysState": 0, "ACM_hbaLamp": 0, "ACM_hbaOnOffState": 0, "ACM_slifOnOffState": 0},
+                         sccm_wheel_touch={"SCCM_WheelTouch_Counter": 0, "SCCM_WheelTouch_HandsOn": 0,
+                                           "SCCM_WheelTouch_CapacitiveValue": 0, "SCCM_WheelTouch_Calibration": 100,
+                                           "SCCM_WheelTouch_ResistiveValue": 0},
+                         toi_fault=False, torque_tx_refused=False, hands_on_level=1, eac_status=1, eac_error_code=0,
+                         acm_fault_supervisor_state=supervisor_state)
+    seq = list(seq) + [(GearShifter.drive, 0)] * (ACM_ENGAGE_TIMEOUT_FRAMES + 10)
+    reports = []
+    for frame, (gear, request) in enumerate(seq):
+      engaged = acc_engages_at is not None and frame >= acc_engages_at
+      CS.out = structs.CarState(gearShifter=gear, vEgo=v_ego, vEgoRaw=v_ego)
+      CS.out.cruiseState.enabled = engaged
+      CS.vdm_adas_status = [dict(dict.fromkeys(self.ADAS_SIGNALS, 0), VDM_UserAdasRequest=request)]
+      CC.update(structs.CarControl().as_reader(), structs.CarControlSP(), CS, 0)
+      if CC.engage_request_refused is not None:
+        reports.append((frame, CC.engage_request_refused))
+        CC.engage_request_refused = None
+    return reports
+
+  def test_low_speed_refusal_is_reported_once(self):
+    D = GearShifter.drive
+    # press on frame 1, reported ~0.5 s later
+    self.assertEqual(self._run([(D, 0), (D, 4), (D, 0)]), [(ACM_ENGAGE_TIMEOUT_FRAMES, 'lowSpeed')])
+
+  def test_not_ready_wins_over_low_speed(self):
+    D = GearShifter.drive
+    self.assertEqual([r for _, r in self._run([(D, 0), (D, 4), (D, 0)], supervisor_state=3)], ['notReady'])
+
+  def test_acm_takes_the_press(self):
+    D = GearShifter.drive
+    self.assertEqual(self._run([(D, 0), (D, 4), (D, 0)], acc_engages_at=4), [])
+
+  def test_refused_above_min_speed_for_another_reason_stays_silent(self):
+    D = GearShifter.drive
+    self.assertEqual(self._run([(D, 0), (D, 4), (D, 0)], v_ego=15.0), [])
+
+  def test_gear_change_out_of_reverse_is_not_watched(self):
+    # stalk-down out of R is a gear change, not an ACC press: no "ACC Needs 20 mph" alert after shifting into Drive
+    R, D = GearShifter.reverse, GearShifter.drive
+    self.assertEqual(self._run([(R, 0), (R, 4), (D, 4), (D, 0)]), [])
+
+
+class TestR1TWheelbase(unittest.TestCase):
+  """The R1T gets its own 3.45 m wheelbase from its VIN; everything else, and the panda side, stays on 3.08 m."""
+
+  @staticmethod
+  def _cp(vin):
+    # the order car_helpers.get_car uses: get_params, then the VIN, then get_params_sp
+    from opendbc.car.rivian.interface import CarInterface
+    fingerprint = gen_empty_fingerprint()
+    cp = CarInterface.get_params(CAR.RIVIAN_R1, fingerprint, [], False, False, False)
+    cp.carVin = vin
+    CarInterface.get_params_sp(cp, CAR.RIVIAN_R1, fingerprint, [], False, False, False)
+    return cp
+
+  @staticmethod
+  def _vin(wmi, line):
+    return wmi + line + "0" * 13
+
+  def test_r1t_gets_its_wheelbase_and_derived_values(self):
+    from opendbc.car import scale_rot_inertia_per_mass, scale_tire_stiffness_per_mass
+    from opendbc.car.rivian.values import R1T_WHEELBASE
+    cp = self._cp(self._vin(WMI.RIVIAN_TRUCK, ModelLine.R1T))
+    r1s = self._cp(self._vin(WMI.RIVIAN_MPV, ModelLine.R1S))
+    assert abs(cp.wheelbase - R1T_WHEELBASE) < 1e-6
+    # the same centre-of-mass fraction as the platform, and the derived values computed as get_params does
+    assert abs(cp.centerToFront / cp.wheelbase - r1s.centerToFront / r1s.wheelbase) < 1e-9
+    assert abs(cp.rotationalInertiaPerMass / scale_rot_inertia_per_mass(cp.wheelbase) - 1) < 1e-6
+    front, rear = scale_tire_stiffness_per_mass(cp.wheelbase, cp.centerToFront, cp.tireStiffnessFactor)
+    assert abs(cp.tireStiffnessFrontPerMass / front - 1) < 1e-6 and abs(cp.tireStiffnessRearPerMass / rear - 1) < 1e-6
+    # nothing else about the car changes
+    assert cp.steerRatio == r1s.steerRatio
+
+  def test_everything_else_keeps_the_platform_wheelbase(self):
+    base = self._cp("")
+    assert abs(base.wheelbase - 3.08) < 1e-6
+    for vin in (self._vin(WMI.RIVIAN_MPV, ModelLine.R1S), "0" * 17, self._vin(WMI.RIVIAN_MPV, ModelLine.R1T),
+                self._vin(WMI.RIVIAN_TRUCK, ModelLine.R1S), self._vin(WMI.RIVIAN_TRUCK, "Z")):
+      with self.subTest(vin=vin[:4]):
+        cp = self._cp(vin)
+        assert (cp.wheelbase, cp.centerToFront, cp.rotationalInertiaPerMass, cp.tireStiffnessFrontPerMass) == \
+               (base.wheelbase, base.centerToFront, base.rotationalInertiaPerMass, base.tireStiffnessFrontPerMass)
+
+  def test_non_essential_params_stay_on_the_platform_wheelbase(self):
+    # what the panda-matched angle limits are built from: it never sees a VIN
+    from opendbc.car.rivian.interface import CarInterface
+    assert abs(CarInterface.get_non_essential_params(CAR.RIVIAN_R1).wheelbase - 3.08) < 1e-6
+
+
+class TestRivianHarnessEligibility(unittest.TestCase):
+  def test_harness_only_bsm_and_longitudinal(self):
+    from opendbc.car.rivian.interface import CarInterface
+    from opendbc.sunnypilot.car.interfaces import has_bsm
+    from opendbc.sunnypilot.car.rivian.values import RivianFlagsSP
+
+    for gen1 in (False, True):
+      for harness in (False, True):
+        for alpha_long in (False, True):
+          with self.subTest(gen1=gen1, harness=harness, alpha_long=alpha_long):
+            fingerprint = gen_empty_fingerprint()
+            if gen1:
+              fingerprint[0][0x321] = 7
+            if harness:
+              fingerprint[1][0x131a] = 8
+            cp = CarInterface.get_params(CAR.RIVIAN_R1, fingerprint, [], alpha_long, False, False)
+            # No GEN1-only broadening before the harness-specific SP pass.
+            self.assertFalse(cp.alphaLongitudinalAvailable)
+            self.assertFalse(cp.openpilotLongitudinalControl)
+            sp = CarInterface.get_params_sp(cp, CAR.RIVIAN_R1, fingerprint, [], alpha_long, False, False)
+            self.assertEqual(cp.alphaLongitudinalAvailable, harness)
+            self.assertEqual(cp.openpilotLongitudinalControl, harness and alpha_long)
+            self.assertEqual(bool(cp.safetyConfigs[0].safetyParam & RivianSafetyFlags.LONG_CONTROL), harness and alpha_long)
+            self.assertEqual(bool(sp.flags & RivianFlagsSP.LONGITUDINAL_HARNESS_UPGRADE), harness)
+            self.assertEqual(has_bsm(cp, sp), harness)
+            self.assertFalse(has_bsm(cp, None))
+
+  def test_blindspot_decode_with_and_without_longitudinal(self):
+    from opendbc.car import Bus
+    from opendbc.can import CANPacker
+    from opendbc.car.rivian.interface import CarInterface
+    from opendbc.car.rivian.carstate import CarState
+    from opendbc.car.rivian.values import DBC
+    from opendbc.sunnypilot.car.rivian.carstate_ext import CarStateExt
+
+    class DisabledParams:
+      def get_bool(self, key):
+        return False
+
+    # Environment seam: only the unrelated persisted resume preference is off.
+    # The BSM parser, CAN packer and state extension execute their actual code.
+    params_module = types.ModuleType('openpilot.common.params')
+    params_module.Params = DisabledParams
+    for harness in (False, True):
+      for alpha_long in (False, True):
+        with self.subTest(harness=harness, alpha_long=alpha_long):
+          fingerprint = gen_empty_fingerprint()
+          if harness:
+            fingerprint[1][0x131a] = 8
+          cp = CarInterface.get_params(CAR.RIVIAN_R1, fingerprint, [], alpha_long, False, False)
+          sp = CarInterface.get_params_sp(cp, CAR.RIVIAN_R1, fingerprint, [], alpha_long, False, False)
+          with mock.patch.dict(sys.modules, {'openpilot.common.params': params_module}):
+            cs = CarStateExt(cp, sp)
+          parsers = CarState.get_can_parsers(cp, sp)
+          self.assertEqual(Bus.alt in parsers, harness)
+          if harness:
+            packer = CANPacker(DBC[CAR.RIVIAN_R1][Bus.alt])
+          for frame, (left, right) in enumerate(((False, False), (True, False), (False, True), (True, True))):
+            if harness:
+              message = packer.make_can_msg('BSM_BlindSpotIndicator_Fwd', 1, {
+                'BSM_BlindSpotIndicator_Left': int(left), 'BSM_BlindSpotIndicator_Right': int(right),
+              })
+              parsers[Bus.alt].update([(1_000_000_000 + frame * 10_000_000, [message])])
+            ret = structs.CarState()
+            cs.update(ret, parsers)
+            self.assertEqual((ret.leftBlindspot, ret.rightBlindspot), (left, right) if harness else (False, False))
